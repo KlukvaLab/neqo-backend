@@ -1,0 +1,31 @@
+[package]
+name = "neqo-backend"
+version = "0.1.0"
+edition = "2024"
+authors = ["KlukvaLab"]
+description = "Isolated transport backend implementing Firefox TLS (NSS) and QUIC (neqo) transports"
+license = "Apache-2.0"
+repository = "https://github.com/KlukvaLab/neqo-backend"
+readme = "README.md"
+keywords = ["quic", "firefox", "nss", "transport", "fingerprint"]
+categories = ["network-programming"]
+
+[lib]
+crate-type = ["cdylib", "rlib", "staticlib"]
+
+[dependencies]
+neqo-transport = { path = "../neqo-transport" }
+neqo-common = { path = "../neqo-common" }
+nss = { workspace = true }
+tokio = { version = "1.43", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
+parking_lot = "0.12"
+base64 = "0.22"
+sha1 = "0.10"
+rand = "0.8"
+log = "0.4"
+env_logger = "0.10"
+thiserror = "2.0"
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio-test = "0.4"

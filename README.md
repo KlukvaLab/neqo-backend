@@ -1,216 +1,43 @@
-# Neqo, an Implementation of QUIC in Rust
+# neqo-backend (Workspace)
 
-![neqo logo](https://github.com/mozilla/neqo/raw/main/neqo.png "neqo logo")
+Self-contained workspace for building `neqo-backend` — an isolated Mozilla Neqo & NSS network transport layer.
 
-Neqo is the QUIC implementation used by Mozilla in Firefox and other products.
-It is written in Rust and provides a library for QUIC transport, HTTP/3, and
-QPACK. The TLS security backend is the Mozilla NSS library, which is also used
-by Firefox.
+Maintained by [KlukvaLab](https://github.com/KlukvaLab).
 
-Neqo is designed to be used in Firefox, but it can also be used
-standalone. We include command line tools for testing and debugging, such as
-`neqo-client` and `neqo-server`, which can be used to test HTTP/3 servers
-and clients.
+## Architecture
 
-**Note: The neqo server functionality is experimental**, since
-it is not in production use at Mozilla, and it is not as mature as the
-client functionality. It is intended to be standards-compliant when
-interoperating with a compliant client, but it may not implement all
-optional protocol features, and it may not handle all edge cases.
-It is also not optimized for performance or resource usage, and
-while it implements many of the necessary features for a server,
-it does not include configuration of a number of options that
-are suited to a live deployment.
-**Do not use the neqo server code in production.**
+This workspace includes Mozilla Neqo (v0.34.0) and the `neqo-backend` C-ABI bridge crate.
 
-To build Neqo:
+- **`neqo-backend/`**: C-ABI bridge exposing WebSocket and QUIC transports with authentic Firefox TLS/QUIC fingerprints.
+- **`neqo-transport/`**, **`neqo-common/`**, etc.: Mozilla's official IETF QUIC implementation in Rust.
 
-```shell
-cargo build
+## Prerequisites
+
+```bash
+sudo apt update && sudo apt install -y build-essential clang pkg-config cmake ninja-build libnss3-dev libnspr4-dev
 ```
 
-This will use a system-installed [NSS][NSS] library if it is new enough. (See "Build with separate NSS/NSPR" below if NSS is not installed or it is deemed too old.)
+If your distribution has NSS older than 3.126, build NSS from source (see `scripts/build_nss.sh`).
 
-To run test HTTP/3 programs (`neqo-client` and `neqo-server`):
+## Quick Start
 
-```shell
-./target/debug/neqo-server '[::]:12345'
-./target/debug/neqo-client 'https://[::]:12345/'
+```bash
+# Build release library
+./build.sh --release
 ```
 
-## Build with separate NSS/NSPR
+Library output: `target/release/libneqo_backend.so`
 
-1. Clone [NSS][NSS] and [NSPR][NSPR] into the same directory and export an environment variable called `NSS_DIR` pointing to NSS.
-   For example if you have a folder `$HOME/neqo-dependencies` and cloned NSS and NSPR into it you'd set `NSS_DIR=$HOME/neqo-dependencies/nss`.
+## Exported C-ABI Functions
 
-2. If you did not already compile NSS separately, you need to have [Mercurial (hg)][HG] installed.
-   NSS builds require [GYP][GYP] and [Ninja][NINJA] to be installed.
+- `ffx_init() -> int32_t`
+- `ffx_connect_ws(host, port, path, headers, probing_marker, out_handle) -> int32_t`
+- `ffx_connect_quic(host, port, alpn, out_handle) -> int32_t`
+- `ffx_stream_read(handle, buf, len, timeout_ms) -> int64_t`
+- `ffx_stream_write(handle, buf, len) -> int64_t`
+- `ffx_stream_close(handle) -> int32_t`
+- `ffx_get_last_error(buf, max_len) -> int32_t`
 
-3. Run `cargo build` in your `neqo` checkout. The prior steps enable `cargo build` to use the existing NSS build or build it from the existing checkout if it hasn't been built yet.
+## License
 
-4. Now that NSS has been built you need to set another environment variable to be able to actually do anything that depends on NSS.
-   - For Linux:
-
-     ```shell
-     export LD_LIBRARY_PATH="$(find $NSS_DIR/.. -name libssl3.so -print | head -1 | xargs dirname | xargs realpath)"
-     ```
-
-   - For macOS:
-
-     ```shell
-     export DYLD_LIBRARY_PATH="$(find $NSS_DIR/.. -name libssl3.dylib -print | head -1 | xargs dirname | xargs realpath)"
-     ```
-
-5. (optional) After having an NSS build you can set the `NSS_PREBUILT=1` environment variable to skip building NSS again on future `cargo build` invocations.
-
-## Debugging Neqo
-
-### QUIC logging
-
-Enable generation of [QLOG][QLOG] logs with:
-
-```shell
-target/debug/neqo-server '[::]:12345' --qlog-dir .
-target/debug/neqo-client 'https://[::]:12345/' --qlog-dir .
-```
-
-You can of course specify a different directory for the QLOG files.
-You can upload QLOG files to [qvis][QVIS] to visualize the flows.
-
-To export QLOG files for [Neqo Simulator](./test-fixture/src/sim) runs, set the
-environment variable `QLOGDIR`. For example:
-
-```shell
-QLOGDIR=/tmp/qlog cargo bench --bench min_bandwidth --features bench
-```
-
-### Using `SSLKEYLOGFILE` to decrypt Wireshark logs
-
-You can export TLS keys by setting the `SSLKEYLOGFILE` environment variable
-to a filename to instruct NSS to dump keys in the
-[standard format](https://datatracker.ietf.org/doc/draft-ietf-tls-keylogfile/)
-to enable decryption by [Wireshark](https://wiki.wireshark.org/TLS) and other tools.
-
-### Using RUST_LOG effectively
-
-As documented in the [env_logger documentation](https://docs.rs/env_logger/),
-the `RUST_LOG` environment variable can be used to selectively enable log messages
-from Rust code. This works for Neqo's command line tools, as well as for when Neqo is
-incorporated into Gecko, although [Gecko needs to be built in debug mode](https://developer.mozilla.org/en-US/docs/Mozilla/Developer_guide/Build_Instructions/Configuring_Build_Options).
-
-Some examples:
-
-1. ```shell
-   RUST_LOG=neqo_transport::dump ./mach run
-   ```
-
-   lists sent and received QUIC packets and their frames' contents only.
-
-1. ```shell
-   RUST_LOG=neqo_transport=debug,neqo_http3=trace,info ./mach run
-   ```
-
-   sets a `debug` log level for `transport`, `trace` level for `http3`, and `info` log
-   level for all other Rust crates, both Neqo and others used by Gecko.
-
-1. ```shell
-   RUST_LOG=neqo=trace,error ./mach run
-   ```
-
-   sets `trace` level for all modules starting with `neqo`, and sets `error` as minimum log level for other unrelated Rust log messages.
-
-### Trying in-development Neqo code in Gecko
-
-In a checked-out copy of Gecko source, set `[patches.*]` values for the
-Neqo crates to local versions in the root `Cargo.toml`. For example, if Neqo
-was checked out to `/home/alice/git/neqo`, add the following lines to the root
-`Cargo.toml`.
-
-```toml
-[patch."https://github.com/mozilla/neqo"]
-neqo-bin = { path = "/home/alice/git/neqo/neqo-bin" }
-neqo-common = { path = "/home/alice/git/neqo/neqo-common" }
-neqo-http3 = { path = "/home/alice/git/neqo/neqo-http3" }
-neqo-qpack = { path = "/home/alice/git/neqo/neqo-qpack" }
-neqo-transport = { path = "/home/alice/git/neqo/neqo-transport" }
-neqo-udp = { path = "/home/alice/git/neqo/neqo-udp" }
-```
-
-Then run the following:
-
-```shell
-./mach vendor rust
-```
-
-Compile Gecko as usual with
-
-```shell
-./mach build
-```
-
-Note: Using newer Neqo code with Gecko may also require changes (likely to `neqo_glue`) if
-something has changed.
-
-### Connect with Firefox to local neqo-server
-
-1. Run `neqo-server` via `cargo run --bin neqo-server -- 'localhost:12345'`.
-2. On Firefox, set `about:config` preferences:
-   - `network.http.http3.alt-svc-mapping-for-testing` to `localhost;h3=":12345"`
-   - `network.http.http3.disable_when_third_party_roots_found` to `false`
-3. Optionally enable logging via `about:logging` or profiling via <https://profiler.firefox.com/>.
-4. Navigate to <https://localhost:12345> and accept the self-signed certificate.
-
-## Releasing Neqo and landing it in Firefox
-
-Neqo follows [semantic versioning](https://semver.org/). While the version is
-still below `1.0`, a **minor** bump (`0.X.0`) signals a breaking change and a
-**patch** bump (`0.X.Y`) is reserved for backwards-compatible fixes.
-
-### Minor release (e.g. `v0.26.0` → `v0.27.0`)
-
-1. Bump the workspace version in [`Cargo.toml`](./Cargo.toml). Commit the
-   resulting `Cargo.toml` and `Cargo.lock` change and open a pull request
-   against `main`.
-2. Merge the pull request.
-3. Create the `vX.Y.Z` git tag pointing at the **merged** commit on `main` and
-   push it.
-4. Publish a [GitHub release](https://github.com/mozilla/neqo/releases) for the
-   new tag.
-5. File a Bugzilla bug under *Core :: Networking* titled `Update neqo to
-   vX.Y.Z` (see [bug 2030978](https://bugzilla.mozilla.org/show_bug.cgi?id=2030978)
-   for an example).
-6. In a [`firefox`](https://github.com/mozilla-firefox/firefox) checkout, bump
-   the `neqo-*` dependency versions in
-   [`netwerk/socket/neqo_glue/Cargo.toml`](https://github.com/mozilla-firefox/firefox/blob/main/netwerk/socket/neqo_glue/Cargo.toml)
-   and
-   [`netwerk/test/http3server/Cargo.toml`](https://github.com/mozilla-firefox/firefox/blob/main/netwerk/test/http3server/Cargo.toml)
-   (see [Phabricator D293565](https://phabricator.services.mozilla.com/D293565)
-   for an example).
-7. Run `./mach -v vendor rust --force --ignore-modified`.
-8. Run `./mach cargo vet` and obtain the necessary supply-chain audits.
-9. Submit the change to Phabricator referencing the Bugzilla bug.
-
-### Patch release (e.g. `v0.26.0` → `v0.26.1`)
-
-Patch releases ship from a long-lived release branch so that `main` can keep
-moving with breaking changes.
-
-1. If it doesn't exist yet, create the `vX.Y` branch on GitHub off the
-   `vX.Y.0` tag (e.g. the
-   [`v0.26`](https://github.com/mozilla/neqo/tree/v0.26) branch was cut from
-   `v0.26.0`). Backport the fixes onto that branch.
-2. From the `vX.Y` branch, open a pull request that bumps the version to
-   `vX.Y.Z` in [`Cargo.toml`](./Cargo.toml) and targets `vX.Y` (not `main`).
-3. Follow steps 2–9 of the minor release flow, tagging and releasing off the
-   `vX.Y` branch instead of `main`. See
-   [bug 2034178](https://bugzilla.mozilla.org/show_bug.cgi?id=2034178) and
-   [Phabricator D296371](https://phabricator.services.mozilla.com/D296371) for
-   an example.
-
-[NSS]: https://hg.mozilla.org/projects/nss
-[NSPR]: https://hg.mozilla.org/projects/nspr
-[GYP]: https://github.com/nodejs/gyp-next
-[HG]: https://www.mercurial-scm.org/
-[NINJA]: https://ninja-build.org/
-[QLOG]: https://datatracker.ietf.org/doc/draft-ietf-quic-qlog-main-schema/
-[QVIS]: https://qvis.quictools.info/
+Apache License 2.0. See [LICENSE](LICENSE).

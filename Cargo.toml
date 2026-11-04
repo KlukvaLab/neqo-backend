@@ -2,6 +2,7 @@
 members = [
   "fuzz",
   "mtu",
+  "neqo-backend",
   "neqo-bin",
   "neqo-common",
   "neqo-http3",
