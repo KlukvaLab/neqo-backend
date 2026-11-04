@@ -5,6 +5,7 @@
 )]
 
 pub mod crypto;
+pub mod mimicry;
 pub mod quic;
 pub mod ws;
 

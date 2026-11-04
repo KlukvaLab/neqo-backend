@@ -14,10 +14,11 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::crypto::verify_peer_certificate;
+use crate::mimicry::{StreamReadBuffer, chunk_payload};
 
 pub struct QuicStream {
     tx_write: mpsc::Sender<Vec<u8>>,
-    rx_read: Mutex<mpsc::Receiver<Vec<u8>>>,
+    rx_read: Mutex<StreamReadBuffer>,
     closed: Arc<tokio::sync::Notify>,
 }
 
@@ -75,13 +76,17 @@ impl QuicStream {
                 let alpn_refs: Vec<&str> = alpn_owned.iter().map(String::as_str).collect();
 
                 let now = Instant::now();
+                // 20s idle timeout enables Neqo's browser keepalive PING probe at 10s idle
+                let params =
+                    ConnectionParameters::default().idle_timeout(std::time::Duration::from_secs(20));
+
                 let mut conn = match Connection::new_client(
                     &server_name,
                     &alpn_refs,
                     cid_gen,
                     local_bound,
                     remote_addr,
-                    ConnectionParameters::default(),
+                    params,
                     now,
                 ) {
                     Ok(c) => c,
@@ -98,13 +103,15 @@ impl QuicStream {
                 loop {
                     let now = Instant::now();
 
-                    // 1. Process outgoing datagrams
+                    // 1. Process outgoing datagrams and capture scheduled timers
+                    let mut next_timer = None;
                     loop {
                         match conn.process_output(now) {
                             Output::Datagram(dgram) => {
                                 let _ = udp_socket.send_to(dgram.as_ref(), remote_addr).await;
                             }
-                            Output::Callback(_) => {
+                            Output::Callback(delay) => {
+                                next_timer = Some(delay);
                                 break;
                             }
                             Output::None => break,
@@ -115,11 +122,10 @@ impl QuicStream {
                     while let Some(event) = conn.next_event() {
                         match event {
                             ConnectionEvent::AuthenticationNeeded => {
-                                // -------------------------------------------------------------
-                                // CERTIFICATE VERIFICATION POINT
-                                // -------------------------------------------------------------
+                                // Strict Mozilla CA root certificate verification
                                 let cert_info = conn.peer_certificate();
-                                let status = verify_peer_certificate(cert_info.as_ref(), &server_name);
+                                let status =
+                                    verify_peer_certificate(cert_info.as_ref(), &server_name);
                                 conn.authenticated(status, now);
                             }
                             ConnectionEvent::RecvStreamReadable { stream_id } => {
@@ -147,12 +153,16 @@ impl QuicStream {
                         }
                     }
 
-                    // If connection became connected and active stream is not yet created
+                    // 3. Activate stream and register browser keepalive
                     if conn.state().connected() && active_stream.is_none() {
                         log::info!("[QUIC] Connected to {}", server_name);
                         match conn.stream_create(StreamType::BiDi) {
                             Ok(sid) => {
                                 active_stream = Some(sid);
+                                // Register stream for native Neqo idle keep-alive PING probes
+                                if let Err(e) = conn.stream_keep_alive(sid, true) {
+                                    log::warn!("[QUIC] Failed to enable stream keepalive: {e:?}");
+                                }
                                 if let Some(notifier) = ready_notifier.take() {
                                     let _ = notifier.send(Ok(()));
                                 }
@@ -171,14 +181,16 @@ impl QuicStream {
                     match conn.state() {
                         State::Closed(err) => {
                             if let Some(notifier) = ready_notifier.take() {
-                                let _ = notifier.send(Err(format!("QUIC connection closed: {err:?}")));
+                                let _ =
+                                    notifier.send(Err(format!("QUIC connection closed: {err:?}")));
                             }
                             break;
                         }
                         State::Closing { .. } | State::Draining { .. } => {
                             if let Some(notifier) = ready_notifier.take() {
                                 let _ = notifier.send(Err(
-                                    "QUIC connection closed before handshake completed".to_string(),
+                                    "QUIC connection closed before handshake completed"
+                                        .to_string(),
                                 ));
                             }
                             break;
@@ -186,7 +198,11 @@ impl QuicStream {
                         _ => {}
                     }
 
-                    // 3. Drive asynchronous I/O and timers
+                    // 4. Drive asynchronous I/O and timers with adaptive sleep
+                    let sleep_duration = next_timer
+                        .unwrap_or(std::time::Duration::from_millis(20))
+                        .min(std::time::Duration::from_millis(25));
+
                     tokio::select! {
                         recv_res = udp_socket.recv_from(&mut buf_in) => {
                             match recv_res {
@@ -201,7 +217,11 @@ impl QuicStream {
                             match write_opt {
                                 Some(data) => {
                                     if let Some(sid) = active_stream {
-                                        let _ = conn.stream_send(sid, &data);
+                                        // MTU-friendly chunking to dirty packet sizes
+                                        let chunks = chunk_payload(&data);
+                                        for chunk in chunks {
+                                            let _ = conn.stream_send(sid, chunk);
+                                        }
                                     }
                                 }
                                 None => {
@@ -216,8 +236,8 @@ impl QuicStream {
                             conn.close(Instant::now(), 0, "kthxbye");
                             break;
                         }
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(15)) => {
-                            // Tick connection timer
+                        _ = tokio::time::sleep(sleep_duration) => {
+                            // Tick connection timer / send scheduled keepalive ping
                         }
                     }
                 }
@@ -231,7 +251,7 @@ impl QuicStream {
         match tokio::time::timeout(handshake_timeout, ready_rx).await {
             Ok(Ok(Ok(()))) => Ok(Self {
                 tx_write,
-                rx_read: Mutex::new(rx_read),
+                rx_read: Mutex::new(StreamReadBuffer::new(rx_read)),
                 closed,
             }),
             Ok(Ok(Err(e))) => Err(e),
@@ -248,14 +268,7 @@ impl QuicStream {
 
     pub async fn read(&self, buf: &mut [u8]) -> Result<usize, String> {
         let mut rx = self.rx_read.lock().await;
-        match rx.recv().await {
-            Some(data) => {
-                let to_copy = std::cmp::min(buf.len(), data.len());
-                buf[..to_copy].copy_from_slice(&data[..to_copy]);
-                Ok(to_copy)
-            }
-            None => Ok(0), // EOF
-        }
+        rx.read(buf).await
     }
 
     pub async fn write(&self, buf: &[u8]) -> Result<usize, String> {
