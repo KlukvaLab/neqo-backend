@@ -16,8 +16,15 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use crate::crypto::verify_peer_certificate;
 use crate::mimicry::{StreamReadBuffer, chunk_payload};
 
+/// Commands for the QUIC worker: data to send, or a stream half-close.
+enum QuicCmd {
+    Data(Vec<u8>),
+    /// Half-close: no more data will be sent on the stream (stream FIN).
+    Finish,
+}
+
 pub struct QuicStream {
-    tx_write: mpsc::Sender<Vec<u8>>,
+    tx_write: mpsc::Sender<QuicCmd>,
     rx_read: Mutex<StreamReadBuffer>,
     closed: Arc<tokio::sync::Notify>,
 }
@@ -44,7 +51,7 @@ impl QuicStream {
             .local_addr()
             .map_err(|e| format!("Failed to get local addr: {e}"))?;
 
-        let (tx_write, mut rx_write) = mpsc::channel::<Vec<u8>>(128);
+        let (tx_write, mut rx_write) = mpsc::channel::<QuicCmd>(128);
         let (tx_read, rx_read) = mpsc::channel::<Vec<u8>>(128);
         let closed = Arc::new(tokio::sync::Notify::new());
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
@@ -198,10 +205,11 @@ impl QuicStream {
                         _ => {}
                     }
 
-                    // 4. Drive asynchronous I/O and timers with adaptive sleep
+                    // 4. Sleep exactly until the next Neqo timer (ACK/PTO/
+                    // keepalive). Incoming datagrams wake us via recv_from;
+                    // the 250ms cap is only a safety tick.
                     let sleep_duration = next_timer
-                        .unwrap_or(std::time::Duration::from_millis(20))
-                        .min(std::time::Duration::from_millis(25));
+                        .unwrap_or(std::time::Duration::from_millis(250));
 
                     tokio::select! {
                         recv_res = udp_socket.recv_from(&mut buf_in) => {
@@ -215,7 +223,7 @@ impl QuicStream {
                         }
                         write_opt = rx_write.recv() => {
                             match write_opt {
-                                Some(data) => {
+                                Some(QuicCmd::Data(data)) => {
                                     if let Some(sid) = active_stream {
                                         // MTU-friendly chunking to dirty packet sizes
                                         let chunks = chunk_payload(&data);
@@ -224,12 +232,13 @@ impl QuicStream {
                                         }
                                     }
                                 }
-                                None => {
+                                Some(QuicCmd::Finish) => {
                                     if let Some(sid) = active_stream {
                                         let _ = conn.stream_close_send(sid);
                                     }
-                                    break;
+                                    // Keep the connection alive for reading.
                                 }
+                                None => break,
                             }
                         }
                         _ = closed_clone.notified() => {
@@ -273,10 +282,19 @@ impl QuicStream {
 
     pub async fn write(&self, buf: &[u8]) -> Result<usize, String> {
         self.tx_write
-            .send(buf.to_vec())
+            .send(QuicCmd::Data(buf.to_vec()))
             .await
             .map_err(|e| format!("Send error: {e}"))?;
         Ok(buf.len())
+    }
+
+    /// Half-closes the stream: sends the stream FIN. The connection stays
+    /// usable for reading (e.g. HTTP/0.9-style request/response).
+    pub async fn finish(&self) -> Result<(), String> {
+        self.tx_write
+            .send(QuicCmd::Finish)
+            .await
+            .map_err(|e| format!("Send error: {e}"))
     }
 
     pub fn close(&self) {

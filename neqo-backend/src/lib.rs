@@ -6,12 +6,14 @@
 
 pub mod crypto;
 pub mod mimicry;
+pub mod nss_sys;
 pub mod quic;
+pub mod tls;
 pub mod ws;
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_int};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock, RwLock};
 use std::time::Duration;
@@ -21,12 +23,27 @@ use tokio::runtime::Runtime;
 
 use crate::crypto::ensure_nss_initialized;
 use crate::quic::QuicStream;
-use crate::ws::WebSocketStream;
+use crate::tls::TlsTransport;
+use crate::ws::{TcpTransport, WebSocketStream, WireTransport};
+
+/// Return codes for `ffx_stream_read` beyond the byte count:
+/// * `-2` unknown handle
+/// * `-3` stream error (see `ffx_get_last_error`)
+/// * `-100` read timed out (stream remains usable — retry)
+pub const FFX_READ_TIMEOUT: i64 = -100;
+
+/// Default ALPN for the WS-over-TLS path, matching Firefox's offer.
+pub const DEFAULT_WS_ALPN: [&str; 2] = ["h2", "http/1.1"];
 
 #[async_trait::async_trait]
 pub trait FirefoxStream: Send + Sync {
     async fn read(&self, buf: &mut [u8]) -> Result<usize, String>;
     async fn write(&self, buf: &[u8]) -> Result<usize, String>;
+    /// Half-closes the sending side (stream FIN). No-op for transports
+    /// without half-close semantics (e.g. WebSocket).
+    async fn finish(&self) -> Result<(), String> {
+        Ok(())
+    }
     fn close(&self);
 }
 
@@ -50,6 +67,9 @@ impl FirefoxStream for QuicStream {
     }
     async fn write(&self, buf: &[u8]) -> Result<usize, String> {
         self.write(buf).await
+    }
+    async fn finish(&self) -> Result<(), String> {
+        self.finish().await
     }
     fn close(&self) {
         self.close();
@@ -79,13 +99,42 @@ fn get_runtime() -> &'static Runtime {
 }
 
 // =========================================================================
-// C-ABI EXPORTS (Zero Neqo/NSS Leaks across boundary)
+// C-ABI EXPORTS (Zero Neqo/NSS leaks across boundary)
 // =========================================================================
+
+/// Backend identification string (static, no freeing required).
+#[unsafe(no_mangle)]
+pub extern "C" fn ffx_version() -> *const c_char {
+    // Static C string; lives for the whole process.
+    static VERSION: &[u8] = b"neqo-backend 0.1.0 (neqo 0.34.0, NSS socket TLS)\0";
+    VERSION.as_ptr().cast()
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ffx_init() -> i32 {
     let _ = env_logger::try_init();
     match ensure_nss_initialized() {
+        Ok(()) => 0,
+        Err(e) => {
+            set_last_error(e);
+            -1
+        }
+    }
+}
+
+/// Adds a trusted root CA (DER-encoded X.509) used alongside the built-in
+/// Mozilla root store. Use this to pin your own proxy CA or a test CA.
+///
+/// # Safety
+/// `der` must point to `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ffx_add_root_ca(der: *const u8, len: usize) -> i32 {
+    if der.is_null() || len == 0 {
+        set_last_error("ffx_add_root_ca: null/empty DER".to_string());
+        return -1;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(der, len) };
+    match crate::crypto::add_root_ca(slice) {
         Ok(()) => 0,
         Err(e) => {
             set_last_error(e);
@@ -101,6 +150,8 @@ pub unsafe extern "C" fn ffx_connect_ws(
     path: *const c_char,
     headers_str: *const c_char,
     probing_marker: *const c_char,
+    use_tls: c_int,
+    alpn: *const c_char,
     out_handle: *mut u64,
 ) -> i32 {
     if host.is_null() || out_handle.is_null() {
@@ -144,17 +195,64 @@ pub unsafe extern "C" fn ffx_connect_ws(
         }
     }
 
+    let alpn_list: Vec<String> = if alpn.is_null() {
+        DEFAULT_WS_ALPN.iter().map(ToString::to_string).collect()
+    } else {
+        unsafe { CStr::from_ptr(alpn) }
+            .to_str()
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .collect()
+    };
+
+    // 1. Establish the wire transport.
+    //    TLS: NSS socket SSL on a dedicated I/O thread (genuine Firefox
+    //    ClientHello). Plaintext TCP is only for local tests.
+    let transport: Arc<dyn WireTransport> = if use_tls != 0 {
+        let refs: Vec<&str> = alpn_list.iter().map(String::as_str).collect();
+        match TlsTransport::connect(&host_str, port, &refs, Duration::from_secs(15)) {
+            Ok(t) => {
+                if t.negotiated_alpn == "h2" {
+                    return {
+                        set_last_error(
+                            "Server selected ALPN h2; WebSocket upgrade requires http/1.1 \
+                             (RFC 8441 WebSockets-over-h2 is not implemented yet)"
+                                .to_string(),
+                        );
+                        -3
+                    };
+                }
+                Arc::new(t)
+            }
+            Err(e) => {
+                set_last_error(e);
+                return -2;
+            }
+        }
+    } else {
+        let rt = get_runtime();
+        match rt.block_on(TcpTransport::connect(&host_str, port)) {
+            Ok(t) => Arc::new(t),
+            Err(e) => {
+                set_last_error(e);
+                return -2;
+            }
+        }
+    };
+
+    // 2. WebSocket handshake over the transport.
     let rt = get_runtime();
-    let res = rt.block_on(async move {
-        WebSocketStream::connect(
-            &host_str,
-            port,
-            &path_str,
-            headers_map,
-            marker_str.as_deref(),
-        )
-        .await
-    });
+    let res = rt.block_on(WebSocketStream::connect(
+        transport,
+        &host_str,
+        port,
+        &path_str,
+        headers_map,
+        marker_str.as_deref(),
+    ));
 
     match res {
         Ok(stream) => {
@@ -165,7 +263,7 @@ pub unsafe extern "C" fn ffx_connect_ws(
         }
         Err(e) => {
             set_last_error(e);
-            -1
+            -3
         }
     }
 }
@@ -190,19 +288,22 @@ pub unsafe extern "C" fn ffx_connect_quic(
         }
     };
 
-    let alpn_list: Vec<&str> = if alpn.is_null() {
-        vec!["h3", "hq-interop"]
+    let alpn_list: Vec<String> = if alpn.is_null() {
+        vec!["h3".to_string(), "hq-interop".to_string()]
     } else {
         unsafe { CStr::from_ptr(alpn) }
             .to_str()
             .unwrap_or("h3")
             .split(',')
             .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
             .collect()
     };
+    let alpn_refs: Vec<&str> = alpn_list.iter().map(String::as_str).collect();
 
     let rt = get_runtime();
-    let res = rt.block_on(async move { QuicStream::connect(&host_str, port, &alpn_list).await });
+    let res = rt.block_on(async move { QuicStream::connect(&host_str, port, &alpn_refs).await });
 
     match res {
         Ok(stream) => {
@@ -218,6 +319,12 @@ pub unsafe extern "C" fn ffx_connect_quic(
     }
 }
 
+/// Reads up to `len` bytes from the stream into `buf`.
+///
+/// Returns the byte count (0 = EOF), or:
+/// * `-2` unknown handle
+/// * `-3` stream error (`ffx_get_last_error` for details)
+/// * `-100` timed out after `timeout_ms` — the stream stays usable, retry
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ffx_stream_read(
     handle: u64,
@@ -245,9 +352,15 @@ pub unsafe extern "C" fn ffx_stream_read(
 
     let future = async {
         if timeout_ms > 0 {
-            tokio::time::timeout(Duration::from_millis(timeout_ms as u64), stream.read(slice))
-                .await
-                .map_err(|_| "Read timeout".to_string())?
+            match tokio::time::timeout(
+                Duration::from_millis(u64::from(timeout_ms)),
+                stream.read(slice),
+            )
+            .await
+            {
+                Ok(res) => res,
+                Err(_) => return Err(FFX_READ_TIMEOUT.to_string()),
+            }
         } else {
             stream.read(slice).await
         }
@@ -256,8 +369,13 @@ pub unsafe extern "C" fn ffx_stream_read(
     match rt.block_on(future) {
         Ok(n) => n as i64,
         Err(e) => {
-            set_last_error(e);
-            -3
+            if e == FFX_READ_TIMEOUT.to_string() {
+                set_last_error(e);
+                FFX_READ_TIMEOUT
+            } else {
+                set_last_error(e);
+                -3
+            }
         }
     }
 }
@@ -284,6 +402,30 @@ pub unsafe extern "C" fn ffx_stream_write(handle: u64, buf: *const u8, len: usiz
 
     match rt.block_on(stream.write(slice)) {
         Ok(n) => n as i64,
+        Err(e) => {
+            set_last_error(e);
+            -3
+        }
+    }
+}
+
+/// Half-closes the stream's sending side (QUIC stream FIN). No-op for
+/// WebSocket streams.
+#[unsafe(no_mangle)]
+pub extern "C" fn ffx_stream_finish(handle: u64) -> i32 {
+    let stream = {
+        let guard = STREAMS.lock();
+        match guard.get(&handle).cloned() {
+            Some(s) => s,
+            None => {
+                set_last_error(format!("Stream handle {handle} not found"));
+                return -2;
+            }
+        }
+    };
+    let rt = get_runtime();
+    match rt.block_on(stream.finish()) {
+        Ok(()) => 0,
         Err(e) => {
             set_last_error(e);
             -3
