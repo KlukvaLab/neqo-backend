@@ -26,6 +26,9 @@ log = "0.4"
 env_logger = "0.10"
 thiserror = "2.0"
 async-trait = "0.1"
+rustls-pki-types = "1.15.1"
+webpki-roots = "1.0.11"
+rustls-webpki = { version = "0.103.16", features = ["ring"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

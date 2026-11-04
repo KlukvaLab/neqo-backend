@@ -169,7 +169,18 @@ impl QuicStream {
 
                     // Check termination conditions
                     match conn.state() {
-                        State::Closed(_) | State::Closing { .. } | State::Draining { .. } => {
+                        State::Closed(err) => {
+                            if let Some(notifier) = ready_notifier.take() {
+                                let _ = notifier.send(Err(format!("QUIC connection closed: {err:?}")));
+                            }
+                            break;
+                        }
+                        State::Closing { .. } | State::Draining { .. } => {
+                            if let Some(notifier) = ready_notifier.take() {
+                                let _ = notifier.send(Err(
+                                    "QUIC connection closed before handshake completed".to_string(),
+                                ));
+                            }
                             break;
                         }
                         _ => {}
@@ -215,15 +226,23 @@ impl QuicStream {
             });
         });
 
-        // Wait for handshake completion
-        match ready_rx.await {
-            Ok(Ok(())) => Ok(Self {
+        // Wait for handshake completion with deterministic timeout
+        let handshake_timeout = std::time::Duration::from_secs(10);
+        match tokio::time::timeout(handshake_timeout, ready_rx).await {
+            Ok(Ok(Ok(()))) => Ok(Self {
                 tx_write,
                 rx_read: Mutex::new(rx_read),
                 closed,
             }),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err("QUIC handshake worker terminated unexpectedly".to_string()),
+            Ok(Ok(Err(e))) => Err(e),
+            Ok(Err(_)) => Err("QUIC handshake worker terminated unexpectedly".to_string()),
+            Err(_) => {
+                closed.notify_waiters();
+                Err(format!(
+                    "QUIC connection to {host}:{port} timed out after {}s",
+                    handshake_timeout.as_secs()
+                ))
+            }
         }
     }
 
