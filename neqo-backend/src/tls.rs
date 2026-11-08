@@ -1,560 +1,527 @@
-//! TLS-over-TCP transport backed by the NSS socket-level SSL API — the same
-//! code path Firefox itself uses for `https://` connections. This is what
-//! produces a *genuine* Firefox TLS fingerprint (ClientHello, extension order,
-//! cipher list, record layer behaviour) with zero synthetic emulation.
+//! TLS-соединения на NSPR/NSS сокетах.
 //!
-//! ## Threading model
-//!
-//! * `TlsTransport::connect` performs DNS resolution, TCP connect and the full
-//!   TLS handshake (including certificate verification) on the calling
-//!   thread, in **nonblocking** mode driven by `PR_Poll` with an overall
-//!   deadline. This is the textbook NSS nonblocking client pattern:
-//!   `PR_Connect` → `PR_Poll` → `PR_ConnectContinue`, then
-//!   `SSL_ForceHandshake` → `PR_Poll` → retry.
-//! * Afterwards the `PRFileDesc` is owned exclusively by one dedicated I/O
-//!   thread running a `PR_Poll` event loop. The async side talks to it over
-//!   channels plus a TCP-socketpair wakeup (NSPR pipes do not support
-//!   `PR_Poll`), so there is no cross-thread `PRFileDesc` access and no
-//!   close/IO race conditions.
-//!
-//! ## NSS gotchas encoded here (verified against NSS 3.132)
-//!
-//! * `PR_SetSocketOption(Nonblocking)` must be called on the **plain TCP fd
-//!   before `SSL_ImportFD`** — after import, the option lands on the SSL
-//!   layer's private struct and never reaches the OS socket.
-//! * The TLS handshake does NOT happen inside `PR_Connect`; it must be forced
-//!   with `SSL_ForceHandshake` (which on a blocking socket would stall the
-//!   whole thread; nonblocking + poll is used instead).
-//! * `SSL_SetNextProtoNego` rotates the protocol list (first entry moves to
-//!   the end, NPN legacy), so we pass the list REVERSED to keep the wire
-//!   order equal to the caller's preference order.
+//! Жизненный цикл (то же, что у nsSSLIOLayer в Firefox):
+//!  1. `PR_NewTCPSocket` → `SSL_ImportFD` (надеваем SSL-слой);
+//!  2. профиль Firefox (`fingerprint::configure_socket`);
+//!  3. non-blocking + `PR_Connect` с дедлайном через `PR_Poll`;
+//!  4. `SSL_ResetHandshake(client)` + `SSL_SetURL`;
+//!  5. `SSL_ForceHandshake` в цикле — ГЛАВНАЯ ЛОВУШКА NSS:
+//!     `PR_Connect` НЕ запускает TLS-handshake, без ForceHandshake
+//!     первый PR_Write просто уедет в сеть открытым текстом (см.
+//!     docs/PITFALLS.md);
+//!  6. read/write через PR_Read/PR_Write с PR_Poll на WOULD_BLOCK.
 
-use std::ffi::CString;
+use std::cell::RefCell;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::os::raw::{c_int, c_uint};
-use std::sync::mpsc as std_mpsc;
+use std::os::raw::{c_int, c_short, c_uint, c_void};
 use std::time::{Duration, Instant};
-use std::{ptr, thread};
 
-use async_trait::async_trait;
-use tokio::sync::{Mutex, mpsc};
+use crate::error::{Error, ErrorCode, Result};
+use crate::fingerprint::{self, Profile, TlsOptions};
+use crate::nssx;
+use crate::verify;
 
-use crate::crypto::{ensure_nss_initialized, verify_chain};
-use crate::mimicry::StreamReadBuffer;
-use crate::nss_sys::*;
-use crate::ws::WireTransport;
+// Статусы/константы из биндингов (constified-имена).
+use nssx::PRStatus_PR_SUCCESS as PR_SUCCESS;
+use nssx::SSLNextProtoState_SSL_NEXT_PROTO_NEGOTIATED as NEXT_PROTO_NEGOTIATED;
+use nssx::SSLNextProtoState_SSL_NEXT_PROTO_SELECTED as NEXT_PROTO_SELECTED;
+use nssx::_SECStatus_SECFailure as SECFailure;
+use nssx::_SECStatus_SECSuccess as SECSuccess;
 
-/// Commands for the I/O thread.
-enum IoCmd {
-    Write(Vec<u8>),
-    Shutdown,
+/// Параметры подключения.
+pub struct ConnectParams<'a> {
+    /// Имя хоста: SNI + проверка сертификата.
+    pub host: &'a str,
+    /// Адрес; `None` → резолвим `host:port` через getaddrinfo.
+    pub addr: Option<SocketAddr>,
+    pub port: u16,
+    /// Список ALPN (например ["h2", "http/1.1"]); `None` — не предлагать.
+    pub alpn: Option<&'a [&'a str]>,
+    /// ECHConfigList (байты ech= из DNS HTTPS-записи).
+    pub ech_config_list: Option<&'a [u8]>,
+    pub profile: Profile,
+    pub timeout: Duration,
 }
 
-/// Context passed through the auth-certificate hook.
-struct AuthCtx {
+impl<'a> ConnectParams<'a> {
+    fn resolve(&self) -> Result<SocketAddr> {
+        if let Some(a) = self.addr {
+            return Ok(a);
+        }
+        let host = self.host.trim_start_matches('[').trim_end_matches(']');
+        match (host, self.port).to_socket_addrs() {
+            Ok(mut addrs) => addrs
+                .next()
+                .ok_or_else(|| Error::new(ErrorCode::DnsFailure, "адрес не разрешён")),
+            Err(e) => Err(Error::new(
+                ErrorCode::DnsFailure,
+                format!("DNS {host}: {e}"),
+            )),
+        }
+    }
+}
+
+struct AuthContext {
     host: String,
+    /// Ошибка из колбэка верификации (проявится после ForceHandshake).
+    cert_error: RefCell<Option<Error>>,
 }
 
-/// # Safety
-/// `PRFileDesc` pointers are only dereferenced on the owning thread; the
-/// socketpair write end is used from any thread, which NSPR permits.
-struct SendFd(*mut PRFileDesc);
-unsafe impl Send for SendFd {}
-unsafe impl Sync for SendFd {}
-
-/// Async TLS transport (NSS socket SSL) with a dedicated I/O thread.
-pub struct TlsTransport {
-    cmd_tx: std_mpsc::Sender<IoCmd>,
-    wake: SendFd,
-    rx: Mutex<StreamReadBuffer>,
-    /// ALPN protocol negotiated with the server (empty = none).
-    pub negotiated_alpn: String,
+pub struct TlsStream {
+    fd: *mut nssx::PRFileDesc,
+    host: String,
+    closed: bool,
 }
 
-impl TlsTransport {
-    /// Connects to `host:port`, performs the Firefox-shaped TLS handshake and
-    /// returns a transport.
-    ///
-    /// `alpn` is in *client preference order* (e.g. `["h2", "http/1.1"]`);
-    /// the ClientHello advertises exactly this order on the wire.
-    pub fn connect(
-        host: &str,
-        port: u16,
-        alpn: &[&str],
-        connect_timeout: Duration,
-    ) -> Result<Self, String> {
-        ensure_nss_initialized()?;
+impl TlsStream {
+    /// Установить TLS-соединение с профилем Firefox.
+    pub fn connect(p: &ConnectParams<'_>) -> Result<TlsStream> {
+        let _ = crate::init::global()?;
+        let addr = p.resolve()?;
+        let deadline = Instant::now() + p.timeout;
 
-        let addr = resolve(host, port)?;
-        let addr_pr = match addr {
-            SocketAddr::V4(v4) => PRNetAddr::ipv4(v4.ip().octets(), port),
-            SocketAddr::V6(v6) => PRNetAddr::ipv6(v6.ip().octets(), port),
-        };
-        let deadline = Instant::now() + connect_timeout;
-
-        // --- Socket + SSL layer setup -----------------------------------
-        let af = if addr.is_ipv4() {
-            PR_AF_INET as PRIntn
-        } else {
-            PR_AF_INET6 as PRIntn
-        };
-        let fd = unsafe { PR_OpenTCPSocket(af) };
-        if fd.is_null() {
-            return Err("PR_OpenTCPSocket failed".to_string());
-        }
-
-        // CRITICAL: set nonblocking on the plain TCP fd BEFORE SSL_ImportFD
-        // (see module docs). It stays nonblocking for its whole life.
-        set_nonblocking(fd)?;
-
-        let ssl_fd = unsafe { SSL_ImportFD(ptr::null_mut(), fd) };
-        if ssl_fd.is_null() {
-            unsafe { PR_Close(fd) };
-            return Err("SSL_ImportFD failed".to_string());
-        }
-
-        // Configure the TLS profile the way Firefox (PSM) does:
-        // security on, client role, session tickets enabled (present in the
-        // Firefox ClientHello), TLS 1.2..1.3, SNI from the host name.
         unsafe {
-            if SSL_OptionSet(ssl_fd, SSL_SECURITY, PR_TRUE) != SECSuccess
-                || SSL_OptionSet(ssl_fd, SSL_HANDSHAKE_AS_CLIENT, PR_TRUE) != SECSuccess
-                || SSL_OptionSet(ssl_fd, SSL_ENABLE_SESSION_TICKETS, PR_TRUE) != SECSuccess
-            {
-                close_quietly(ssl_fd);
-                return Err("SSL_OptionSet failed".to_string());
+            // 1. TCP-сокет и SSL-слой.
+            let tcp = nssx::PR_NewTCPSocket();
+            if tcp.is_null() {
+                return Err(Error::new(ErrorCode::Generic, "PR_NewTCPSocket"));
+            }
+            let fd = nssx::SSL_ImportFD(std::ptr::null_mut(), tcp);
+            if fd.is_null() {
+                nssx::PR_Close(tcp);
+                return Err(Error::new(ErrorCode::Generic, "SSL_ImportFD"));
             }
 
-            let range = SSLVersionRange {
-                min: SSL_LIBRARY_VERSION_TLS_1_2,
-                max: SSL_LIBRARY_VERSION_TLS_1_3,
+            // 2. Профиль Firefox ДО handshake.
+            let tls_opts = TlsOptions {
+                ech_config_list: p.ech_config_list,
             };
-            if SSL_VersionRangeSet(ssl_fd, &range) != SECSuccess {
-                close_quietly(ssl_fd);
-                return Err("SSL_VersionRangeSet failed".to_string());
+            if let Err(e) = fingerprint::configure_socket(fd, p.profile, &tls_opts) {
+                nssx::PR_Close(fd);
+                return Err(e);
             }
 
-            let url = CString::new(host).map_err(|_| "host contains NUL byte".to_string())?;
-            if SSL_SetURL(ssl_fd, url.as_ptr()) != SECSuccess {
-                close_quietly(ssl_fd);
-                return Err(format!("SSL_SetURL({host}) failed"));
+            // 3. Non-blocking + connect с дедлайном.
+            if let Err(e) = set_nonblocking(fd, true) {
+                nssx::PR_Close(fd);
+                return Err(e);
             }
-
-            // ALPN (see module docs about list rotation).
-            if !alpn.is_empty() {
-                let mut wire = Vec::new();
-                for p in alpn.iter().rev() {
-                    let bytes = p.as_bytes();
-                    if bytes.is_empty() || bytes.len() > 255 {
-                        close_quietly(ssl_fd);
-                        return Err(format!("Invalid ALPN protocol: {p:?}"));
+            let netaddr = netaddr_from(&addr);
+            let mut rv = nssx::PR_Connect(fd, &netaddr, nssx::PR_INTERVAL_NO_TIMEOUT);
+            if rv != PR_SUCCESS {
+                let err = nssx::PR_GetError();
+                if err != nssx::PR_IN_PROGRESS_ERROR {
+                    nssx::PR_Close(fd);
+                    return Err(pr_error(ErrorCode::ConnectFailed, err, "PR_Connect"));
+                }
+                // Ждём завершения connect.
+                if let Err(e) = poll_status(
+                    fd,
+                    PR_POLL_WRITE | PR_POLL_EXCEPT,
+                    deadline,
+                    "connect",
+                ) {
+                    nssx::PR_Close(fd);
+                    return Err(e);
+                }
+                rv = nssx::PR_ConnectContinue(fd, PR_POLL_WRITE as c_short);
+                if rv != PR_SUCCESS {
+                    let err = nssx::PR_GetError();
+                    if err != nssx::PR_IS_CONNECTED_ERROR {
+                        nssx::PR_Close(fd);
+                        return Err(pr_error(ErrorCode::ConnectFailed, err, "PR_ConnectContinue"));
                     }
-                    wire.push(bytes.len() as u8);
-                    wire.extend_from_slice(bytes);
-                }
-                if SSL_SetNextProtoNego(ssl_fd, wire.as_ptr(), wire.len() as c_uint) != SECSuccess {
-                    close_quietly(ssl_fd);
-                    return Err("SSL_SetNextProtoNego failed".to_string());
                 }
             }
 
-            // Certificate verification hook — strict, no bypasses.
-            let ctx = Box::into_raw(Box::new(AuthCtx {
-                host: host.to_string(),
-            }));
-            if SSL_AuthCertificateHook(ssl_fd, Some(auth_certificate_hook), ctx.cast())
+            // 4. Клиентский handshake.
+            if nssx::SSL_ResetHandshake(fd, 0) != SECSuccess {
+                let err = nssx::PR_GetError();
+                nssx::PR_Close(fd);
+                return Err(pr_error(ErrorCode::HandshakeFailed, err, "SSL_ResetHandshake"));
+            }
+            let chost = std::ffi::CString::new(p.host)
+                .map_err(|_| Error::invalid_arg("host содержит NUL"))?;
+            if nssx::SSL_SetURL(fd, chost.as_ptr()) != SECSuccess {
+                let err = nssx::PR_GetError();
+                nssx::PR_Close(fd);
+                return Err(pr_error(ErrorCode::HandshakeFailed, err, "SSL_SetURL"));
+            }
+
+            // 5. ALPN (SSL_SetNextProtoNego — это и есть ALPN-API NSS).
+            if let Some(list) = p.alpn {
+                let wire = alpn_wire(list);
+                if nssx::SSL_SetNextProtoNego(fd, wire.as_ptr(), wire.len() as c_uint)
+                    != SECSuccess
+                {
+                    let err = nssx::PR_GetError();
+                    nssx::PR_Close(fd);
+                    return Err(pr_error(ErrorCode::HandshakeFailed, err, "SSL_SetNextProtoNego"));
+                }
+            }
+
+            // 6. Колбэк верификации сертификата (как PSM в Firefox).
+            let auth_ctx = Box::new(AuthContext {
+                host: p.host.to_string(),
+                cert_error: RefCell::new(None),
+            });
+            let ctx_ptr = Box::into_raw(auth_ctx) as *mut c_void;
+            if nssx::SSL_AuthCertificateHook(fd, Some(auth_certificate_cb), ctx_ptr)
                 != SECSuccess
             {
-                drop(Box::from_raw(ctx));
-                close_quietly(ssl_fd);
-                return Err("SSL_AuthCertificateHook failed".to_string());
+                drop(Box::from_raw(ctx_ptr as *mut AuthContext));
+                nssx::PR_Close(fd);
+                return Err(Error::new(ErrorCode::Generic, "SSL_AuthCertificateHook"));
             }
 
-            // --- Nonblocking TCP connect (PR_Connect / poll / continue) --
-            if PR_Connect(ssl_fd, &addr_pr, PR_INTERVAL_NO_TIMEOUT) != PR_SUCCESS {
-                let err = PR_GetError();
-                if err != PR_IN_PROGRESS_ERROR {
-                    drop(Box::from_raw(ctx));
-                    close_quietly(ssl_fd);
-                    return Err(format!(
-                        "TCP connect to {host}:{port} failed: {}",
-                        nspr_error_name(err)
-                    ));
-                }
-                loop {
-                    if Instant::now() >= deadline {
-                        drop(Box::from_raw(ctx));
-                        close_quietly(ssl_fd);
-                        return Err(format!("TCP connect to {host}:{port} timed out"));
-                    }
-                    let mut pfd = PRPollDesc {
-                        fd: ssl_fd,
-                        in_flags: (PR_POLL_WRITE | PR_POLL_EXCEPT) as i16,
-                        out_flags: 0,
-                    };
-                    let n = PR_Poll(&raw mut pfd, 1, poll_timeout_until(deadline));
-                    if n < 0 {
-                        let e = PR_GetError();
-                        drop(Box::from_raw(ctx));
-                        close_quietly(ssl_fd);
-                        return Err(format!(
-                            "PR_Poll during connect failed: {}",
-                            nspr_error_name(e)
-                        ));
-                    }
-                    if PR_ConnectContinue(ssl_fd, pfd.out_flags) == PR_SUCCESS {
-                        break;
-                    }
-                    let e = PR_GetError();
-                    if e != PR_IN_PROGRESS_ERROR && e != PR_WOULD_BLOCK_ERROR {
-                        drop(Box::from_raw(ctx));
-                        close_quietly(ssl_fd);
-                        return Err(format!(
-                            "TCP connect to {host}:{port} failed: {}",
-                            nspr_error_name(e)
-                        ));
-                    }
-                }
-            }
-
-            // --- TLS handshake (ForceHandshake / poll / retry) -----------
+            // 7. ForceHandshake — см. docs/PITFALLS.md.
             loop {
-                let rv = SSL_ForceHandshake(ssl_fd);
+                if Instant::now() >= deadline {
+                    drop(Box::from_raw(ctx_ptr as *mut AuthContext));
+                    nssx::PR_Close(fd);
+                    return Err(Error::timeout("handshake: таймаут"));
+                }
+                let rv = nssx::SSL_ForceHandshake(fd);
                 if rv == SECSuccess {
                     break;
                 }
-                let err = PR_GetError();
-                if err != PR_WOULD_BLOCK_ERROR {
-                    drop(Box::from_raw(ctx));
-                    close_quietly(ssl_fd);
-                    return Err(format!(
-                        "TLS handshake with {host}:{port} failed: {} (strict certificate verification is enforced)",
-                        nspr_error_name(err)
+                let err = nssx::PR_GetError();
+                if err == nssx::PR_WOULD_BLOCK_ERROR {
+                    // SSL хочет читать ИЛИ писать — опрашиваем оба.
+                    if let Err(e) =
+                        poll_status(fd, PR_POLL_READ | PR_POLL_WRITE, deadline, "handshake")
+                    {
+                        drop(Box::from_raw(ctx_ptr as *mut AuthContext));
+                        nssx::PR_Close(fd);
+                        return Err(e);
+                    }
+                    continue;
+                }
+                let ctx = Box::from_raw(ctx_ptr as *mut AuthContext);
+                nssx::PR_Close(fd);
+                // Ошибка верификации важнее транспортной.
+                if let Some(cert_err) = ctx.cert_error.borrow_mut().take() {
+                    return Err(cert_err);
+                }
+                if err == nssx::SSLErrorCodes_SSL_ERROR_ECH_RETRY_WITH_ECH as i32 {
+                    return Err(Error::new(
+                        ErrorCode::EchRetryWithEch,
+                        "сервер отклонил ECH и вернул новые конфиги (nb_tls_ech_retry_configs)",
                     ));
                 }
-                if Instant::now() >= deadline {
-                    drop(Box::from_raw(ctx));
-                    close_quietly(ssl_fd);
-                    return Err(format!("TLS handshake with {host}:{port} timed out"));
-                }
-                let mut pfd = PRPollDesc {
-                    fd: ssl_fd,
-                    in_flags: (PR_POLL_READ | PR_POLL_WRITE) as i16,
-                    out_flags: 0,
-                };
-                let n = PR_Poll(&raw mut pfd, 1, poll_timeout_until(deadline));
-                if n < 0 {
-                    let e = PR_GetError();
-                    drop(Box::from_raw(ctx));
-                    close_quietly(ssl_fd);
-                    return Err(format!(
-                        "PR_Poll during handshake failed: {}",
-                        nspr_error_name(e)
-                    ));
-                }
+                return Err(pr_error(ErrorCode::HandshakeFailed, err, "SSL_ForceHandshake"));
             }
-            drop(Box::from_raw(ctx));
 
-            // Which ALPN protocol did the server pick?
-            let mut state: c_int = 0;
-            let mut proto_buf = [0u8; 255];
-            let mut proto_len: c_uint = 0;
-            let mut negotiated = String::new();
-            if SSL_GetNextProto(
-                ssl_fd,
-                &raw mut state,
-                proto_buf.as_mut_ptr(),
-                &raw mut proto_len,
-                proto_buf.len() as c_uint,
-            ) == SECSuccess
-                && proto_len > 0
-            {
-                negotiated = String::from_utf8_lossy(&proto_buf[..proto_len as usize]).to_string();
+            let ctx = Box::from_raw(ctx_ptr as *mut AuthContext);
+            if let Some(cert_err) = ctx.cert_error.borrow_mut().take() {
+                nssx::PR_Close(fd);
+                return Err(cert_err);
             }
-            log::info!(
-                "[TLS] Connected to {host}:{port}; TLS handshake OK; ALPN = {:?}",
-                if negotiated.is_empty() {
-                    "(none)"
-                } else {
-                    &negotiated
-                }
-            );
 
-            // Wakeup channel: TCP socketpair (NSPR pipes don't support poll).
-            let mut pair: [*mut PRFileDesc; 2] = [ptr::null_mut(); 2];
-            if PR_NewTCPSocketPair(pair.as_mut_ptr()) != PR_SUCCESS {
-                close_quietly(ssl_fd);
-                return Err("PR_NewTCPSocketPair failed".to_string());
-            }
-            let (wake_read, wake_write) = (pair[0], pair[1]);
-            set_nonblocking(wake_read)?;
-
-            let (cmd_tx, cmd_rx) = std_mpsc::channel::<IoCmd>();
-            let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(256);
-
-            let io_fd = SendFd(ssl_fd);
-            let io_wake = SendFd(wake_read);
-            thread::Builder::new()
-                .name("nss-tls-io".to_string())
-                .spawn(move || {
-                    io_loop(io_fd, io_wake, cmd_rx, data_tx);
-                })
-                .map_err(|e| {
-                    close_quietly(ssl_fd);
-                    PR_Close(wake_read);
-                    PR_Close(wake_write);
-                    format!("Failed to spawn TLS I/O thread: {e}")
-                })?;
-
-            Ok(Self {
-                cmd_tx,
-                wake: SendFd(wake_write),
-                rx: Mutex::new(StreamReadBuffer::new(data_rx)),
-                negotiated_alpn: negotiated,
+            Ok(TlsStream {
+                fd,
+                host: p.host.to_string(),
+                closed: false,
             })
         }
     }
 
-    fn wake_io_thread(&self) {
-        // One byte wakes the poll loop; the loop drains the socketpair.
-        let byte: u8 = 1;
-        let fd = self.wake.0;
-        let _ = unsafe { PR_Write(fd, (&byte as *const u8).cast(), 1) };
+    /// Прочитать до `buf.len()` байт; 0 = EOF (чистое закрытие).
+    pub fn read(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize> {
+        self.check_alive()?;
+        let deadline = Instant::now() + timeout;
+        unsafe {
+            loop {
+                let n = nssx::PR_Read(self.fd, buf.as_mut_ptr().cast(), buf.len() as c_int);
+                if n > 0 {
+                    return Ok(n as usize);
+                }
+                if n == 0 {
+                    self.closed = true;
+                    return Ok(0);
+                }
+                let err = nssx::PR_GetError();
+                if err == nssx::PR_WOULD_BLOCK_ERROR {
+                    poll_status(self.fd, PR_POLL_READ, deadline, "read")?;
+                    continue;
+                }
+                self.closed = true;
+                return Err(pr_error(ErrorCode::Generic, err, "PR_Read"));
+            }
+        }
     }
-}
 
-#[async_trait]
-impl WireTransport for TlsTransport {
-    async fn read(&self, buf: &mut [u8]) -> Result<usize, String> {
-        let mut rx = self.rx.lock().await;
-        rx.read(buf).await
-    }
-
-    async fn write_all(&self, buf: &[u8]) -> Result<(), String> {
-        self.cmd_tx
-            .send(IoCmd::Write(buf.to_vec()))
-            .map_err(|_| "TLS I/O thread terminated".to_string())?;
-        self.wake_io_thread();
+    /// Записать весь буфер (частичная запись — продолжаем в цикле).
+    pub fn write_all(&mut self, buf: &[u8], timeout: Duration) -> Result<()> {
+        self.check_alive()?;
+        let deadline = Instant::now() + timeout;
+        let mut off = 0usize;
+        unsafe {
+            while off < buf.len() {
+                let n = nssx::PR_Write(
+                    self.fd,
+                    buf[off..].as_ptr().cast(),
+                    (buf.len() - off) as c_int,
+                );
+                if n >= 0 {
+                    off += n as usize;
+                    continue;
+                }
+                let err = nssx::PR_GetError();
+                if err == nssx::PR_WOULD_BLOCK_ERROR {
+                    poll_status(self.fd, PR_POLL_WRITE, deadline, "write")?;
+                    continue;
+                }
+                self.closed = true;
+                return Err(pr_error(ErrorCode::Generic, err, "PR_Write"));
+            }
+        }
         Ok(())
     }
 
-    fn shutdown(&self) {
-        if self.cmd_tx.send(IoCmd::Shutdown).is_ok() {
-            self.wake_io_thread();
+    /// Согласованный ALPN, если был.
+    pub fn negotiated_alpn(&self) -> Result<Option<String>> {
+        self.check_alive()?;
+        unsafe {
+            let mut state: nssx::SSLNextProtoState = std::mem::zeroed();
+            let mut out = [0u8; 255];
+            let mut out_len: c_uint = 0;
+            let rv = nssx::SSL_GetNextProto(
+                self.fd,
+                &mut state,
+                out.as_mut_ptr(),
+                &mut out_len,
+                out.len() as c_uint,
+            );
+            if rv != SECSuccess {
+                return Ok(None);
+            }
+            match state {
+                NEXT_PROTO_NEGOTIATED | NEXT_PROTO_SELECTED => {
+                    let s = String::from_utf8_lossy(&out[..out_len as usize]).into_owned();
+                    Ok(Some(s))
+                }
+                _ => Ok(None),
+            }
         }
     }
-}
 
-impl Drop for TlsTransport {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
-/// The single-owner I/O event loop for one TLS connection.
-///
-/// `fd_wrapper` / `wake_wrapper` exist so raw pointers cross the thread
-/// boundary inside a `Send`-asserting newtype (edition-2024 closures would
-/// otherwise capture the raw field itself).
-fn io_loop(
-    fd_wrapper: SendFd,
-    wake_wrapper: SendFd,
-    cmd_rx: std_mpsc::Receiver<IoCmd>,
-    data_tx: mpsc::Sender<Vec<u8>>,
-) {
-    let fd = fd_wrapper.0;
-    let wake_read = wake_wrapper.0;
-    let mut out_buf: Vec<u8> = Vec::new();
-    let mut shutting_down = false;
-    let mut poll_fds: [PRPollDesc; 2] = [PRPollDesc {
-        fd: ptr::null_mut(),
-        in_flags: 0,
-        out_flags: 0,
-    }; 2];
-
-    loop {
-        poll_fds[0].fd = fd;
-        poll_fds[0].in_flags = PR_POLL_READ as i16
-            | if out_buf.is_empty() {
-                0
-            } else {
-                PR_POLL_WRITE as i16
-            };
-        poll_fds[0].out_flags = 0;
-        poll_fds[1].fd = wake_read;
-        poll_fds[1].in_flags = PR_POLL_READ as i16;
-        poll_fds[1].out_flags = 0;
-
-        let n = unsafe { PR_Poll(poll_fds.as_mut_ptr(), 2, PR_MillisecondsToInterval(250)) };
-        if n < 0 {
-            break; // poll error — fatal
+    /// ECHConfigList для ретрая (после ErrorCode::EchRetryWithEch).
+    pub fn ech_retry_configs(&self) -> Result<Vec<u8>> {
+        unsafe {
+            let get: Option<
+                unsafe extern "C" fn(*mut nssx::PRFileDesc, *mut *mut nssx::SECItem) -> c_int,
+            > = resolve_experimental(c"SSL_GetEchRetryConfigs");
+            let f = get.ok_or_else(|| {
+                Error::new(ErrorCode::Unsupported, "ECH не поддерживается сборкой NSS")
+            })?;
+            let mut item: *mut nssx::SECItem = std::ptr::null_mut();
+            if f(self.fd, &mut item) != SECSuccess {
+                return Err(pr_error(ErrorCode::Generic, nssx::PR_GetError(), "EchRetryConfigs"));
+            }
+            if item.is_null() || (*item).data.is_null() {
+                return Ok(Vec::new());
+            }
+            let bytes =
+                std::slice::from_raw_parts((*item).data, (*item).len as usize).to_vec();
+            nssx::SECITEM_FreeItem(item, 1);
+            Ok(bytes)
         }
+    }
 
-        // 1. Wakeup socketpair: drain it, then drain the command queue.
-        if poll_fds[1].out_flags & (PR_POLL_READ as i16) != 0 {
-            let mut drain = [0u8; 64];
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    fn check_alive(&self) -> Result<()> {
+        if self.closed {
+            return Err(Error::new(ErrorCode::Closed, "соединение закрыто"));
+        }
+        Ok(())
+    }
+
+    /// Аккуратное закрытие: close_notify + free.
+    pub fn close(&mut self) {
+        if !self.closed {
+            self.closed = true;
             unsafe {
-                // wake_read is nonblocking: read until it would block.
-                while PR_Read(wake_read, drain.as_mut_ptr().cast(), drain.len() as PRInt32) > 0 {}
+                // PR_Close на SSL-дескрипторе отправляет close_notify.
+                nssx::PR_Close(self.fd);
             }
         }
-        while let Ok(cmd) = cmd_rx.try_recv() {
-            match cmd {
-                IoCmd::Write(data) => {
-                    out_buf.extend_from_slice(&data);
-                    if out_buf.len() > 64 * 1024 * 1024 {
-                        // Backstop against an unbounded write backlog.
-                        log::error!("[TLS] Write backlog exceeded 64 MiB, closing connection");
-                        shutting_down = true;
-                        out_buf.clear();
-                        break;
-                    }
-                }
-                IoCmd::Shutdown => {
-                    shutting_down = true;
-                    break;
-                }
-            }
-        }
-        if shutting_down && out_buf.is_empty() {
-            break;
-        }
-
-        // 2. Flush pending outbound bytes. Attempted whenever out_buf is
-        //    non-empty (the socket is nonblocking, would-block is benign) —
-        //    the poll WRITE flag may be stale for data queued this iteration.
-        if !out_buf.is_empty() {
-            loop {
-                if out_buf.is_empty() {
-                    break;
-                }
-                let chunk_len = out_buf.len().min(64 * 1024) as PRInt32;
-                let written = unsafe { PR_Write(fd, out_buf.as_ptr().cast(), chunk_len) };
-                if written > 0 {
-                    out_buf.drain(..written as usize);
-                } else {
-                    break; // would-block or error; retry on the next iteration
-                }
-            }
-            if out_buf.is_empty() && shutting_down {
-                break;
-            }
-            if out_buf.is_empty() {
-                continue; // re-poll without the WRITE flag
-            }
-        }
-
-        // 3. Socket readable: read and forward upstream.
-        if poll_fds[0].out_flags & (PR_POLL_READ as i16) != 0 {
-            loop {
-                let mut chunk = vec![0u8; 64 * 1024];
-                let nread =
-                    unsafe { PR_Read(fd, chunk.as_mut_ptr().cast(), chunk.len() as PRInt32) };
-                if nread > 0 {
-                    chunk.truncate(nread as usize);
-                    if data_tx.blocking_send(chunk).is_err() {
-                        // Consumer dropped: remote close.
-                        shutting_down = true;
-                        out_buf.clear();
-                        break;
-                    }
-                } else if nread == 0 {
-                    // EOF
-                    shutting_down = true;
-                    out_buf.clear();
-                    break;
-                } else {
-                    let err = unsafe { PR_GetError() };
-                    if err == PR_WOULD_BLOCK_ERROR {
-                        break; // drained for now
-                    }
-                    shutting_down = true;
-                    out_buf.clear();
-                    break;
-                }
-            }
-            if shutting_down && out_buf.is_empty() {
-                break;
-            }
-        }
-    }
-
-    // Owned exclusively by this thread: closing here is race-free.
-    // (wake_write belongs to TlsTransport and is closed when it drops.)
-    unsafe {
-        PR_Shutdown(fd, PR_SHUTDOWN_BOTH);
-        PR_Close(fd);
-        PR_Close(wake_read);
-    }
-    // Dropping data_tx closes the mpsc → reader sees EOF.
-    drop(data_tx);
-}
-
-/// Strict certificate verification hook (runs during the TLS handshake).
-unsafe extern "C" fn auth_certificate_hook(
-    arg: *mut std::ffi::c_void,
-    fd: *mut PRFileDesc,
-    _checksig: PRBool,
-    _is_server: PRBool,
-) -> SECStatus {
-    let ctx = unsafe { &*(arg.cast::<AuthCtx>()) };
-    let chain = unsafe { peer_certificate_chain_der(fd) };
-    if verify_chain(&chain, &ctx.host) {
-        SECSuccess
-    } else {
-        // Rejected: bad/missing chain, untrusted root or SAN mismatch.
-        SECFailure
     }
 }
 
-fn set_nonblocking(fd: *mut PRFileDesc) -> Result<(), String> {
-    let mut opt = PRSocketOptionData {
-        option: PR_SockOpt_Nonblocking,
-        value_nonblocking: PR_TRUE,
-    };
-    if unsafe { PR_SetSocketOption(fd, &raw mut opt) } != PR_SUCCESS {
-        unsafe { PR_Close(fd) };
-        Err("PR_SetSocketOption(Nonblocking) failed".to_string())
-    } else {
+impl Drop for TlsStream {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+// --- Вспомогательное ------------------------------------------------------------
+
+const PR_POLL_READ: i16 = 0x1;
+const PR_POLL_WRITE: i16 = 0x4;
+const PR_POLL_EXCEPT: i16 = 0x2;
+
+unsafe fn set_nonblocking(fd: *mut nssx::PRFileDesc, on: bool) -> Result<()> {
+    let mut opt: nssx::PRSocketOptionData = std::mem::zeroed();
+    opt.option = nssx::PRSockOption_PR_SockOpt_Nonblocking;
+    // Именованное поле union `value`, ветка `non_blocking` (PRBool).
+    opt.value.non_blocking = on as i32;
+    if nssx::PR_SetSocketOption(fd, &opt) == PR_SUCCESS {
         Ok(())
-    }
-}
-
-fn close_quietly(fd: *mut PRFileDesc) {
-    unsafe { PR_Close(fd) };
-}
-
-fn resolve(host: &str, port: u16) -> Result<SocketAddr, String> {
-    let addr_str = format!("{host}:{port}");
-    addr_str
-        .to_socket_addrs()
-        .map_err(|e| format!("Failed to resolve {addr_str}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("No addresses for {addr_str}"))
-}
-
-/// Remaining poll timeout in NSPR interval units, capped at 250ms slices so
-/// the deadline is re-checked.
-fn poll_timeout_until(deadline: Instant) -> PRIntervalTime {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let ms = remaining.as_millis().min(250) as u32;
-    if ms == 0 {
-        PR_INTERVAL_NO_WAIT
     } else {
-        unsafe { PR_MillisecondsToInterval(ms) }
+        Err(pr_error(ErrorCode::Generic, nssx::PR_GetError(), "PR_SetSocketOption"))
     }
 }
 
-fn nspr_error_name(code: PRInt32) -> String {
-    let name = match code {
-        PR_WOULD_BLOCK_ERROR => "PR_WOULD_BLOCK_ERROR",
-        PR_IO_TIMEOUT_ERROR => "PR_IO_TIMEOUT_ERROR",
-        PR_CONNECT_REFUSED_ERROR => "PR_CONNECT_REFUSED_ERROR",
-        PR_NETWORK_UNREACHABLE_ERROR => "PR_NETWORK_UNREACHABLE_ERROR",
-        PR_CONNECT_TIMEOUT_ERROR => "PR_CONNECT_TIMEOUT_ERROR",
-        PR_CONNECT_RESET_ERROR => "PR_CONNECT_RESET_ERROR",
-        PR_IN_PROGRESS_ERROR => "PR_IN_PROGRESS_ERROR",
-        _ => "PR error",
+/// Ждать готовности (флаги PR_POLL_*) до дедлайна.
+unsafe fn poll_status(
+    fd: *mut nssx::PRFileDesc,
+    flags: i16,
+    deadline: Instant,
+    what: &str,
+) -> Result<()> {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(Error::timeout(format!("{what}: таймаут")));
+        }
+        let ms = ((deadline - now).as_millis().min(u32::MAX as u128 - 1) as u32 + 1)
+            .min(60_000);
+        let mut pfd = nssx::PRPollDesc {
+            fd,
+            in_flags: flags,
+            out_flags: 0,
+        };
+        let n = nssx::PR_Poll(&mut pfd, 1, nssx::PR_MillisecondsToInterval(ms));
+        if n > 0 {
+            return Ok(());
+        }
+        if n == 0 {
+            continue; // истёк наш под-таймаут — проверяем дедлайн
+        }
+        let err = nssx::PR_GetError();
+        if err == nssx::PR_PENDING_INTERRUPT_ERROR {
+            continue;
+        }
+        return Err(pr_error(ErrorCode::Generic, err, "PR_Poll"));
+    }
+}
+
+/// PRNetAddr из SocketAddr. Раскладка PRNetAddr стабильна десятилетиями:
+/// [0..2) family (u16, host order), [2..4) port (u16, network order),
+/// v4: [4..8) ip; v6: [4..8) flowinfo, [8..24) addr, [24..28) scope_id.
+fn netaddr_from(addr: &SocketAddr) -> nssx::PRNetAddr {
+    let mut buf = [0u8; 28];
+    match addr {
+        SocketAddr::V4(a) => {
+            buf[0..2].copy_from_slice(&(nssx::PR_AF_INET as u16).to_le_bytes());
+            buf[2..4].copy_from_slice(&a.port().to_be_bytes());
+            buf[4..8].copy_from_slice(&a.ip().octets());
+        }
+        SocketAddr::V6(a) => {
+            buf[0..2].copy_from_slice(&(nssx::PR_AF_INET6 as u16).to_le_bytes());
+            buf[2..4].copy_from_slice(&a.port().to_be_bytes());
+            buf[4..8].copy_from_slice(&0u32.to_le_bytes()); // flowinfo
+            buf[8..24].copy_from_slice(&a.ip().octets());
+            buf[24..28].copy_from_slice(&a.scope_id().to_le_bytes());
+        }
+    }
+    unsafe { std::ptr::read(buf.as_ptr() as *const nssx::PRNetAddr) }
+}
+
+/// ALPN-список в wire-формате: длина-байт + протокол.
+fn alpn_wire(list: &[&str]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for p in list {
+        let b = p.as_bytes();
+        out.push(b.len() as u8);
+        out.extend_from_slice(b);
+    }
+    out
+}
+
+/// Колбэк верификации для NSS (аналог AuthCertificate в PSM).
+unsafe extern "C" fn auth_certificate_cb(
+    arg: *mut c_void,
+    fd: *mut nssx::PRFileDesc,
+    _checksig: c_int,
+    _is_server: c_int,
+) -> c_int {
+    let ctx = &*(arg as *const AuthContext);
+    match peer_chain(fd) {
+        Ok(chain) => match verify::verify_server_chain(&chain, &ctx.host) {
+            Ok(()) => SECSuccess,
+            Err(e) => {
+                *ctx.cert_error.borrow_mut() = Some(e);
+                nssx::PR_SetError(nssx::SSLErrorCodes_SSL_ERROR_BAD_CERTIFICATE as i32, 0);
+                SECFailure
+            }
+        },
+        Err(e) => {
+            *ctx.cert_error.borrow_mut() = Some(e);
+            nssx::PR_SetError(nssx::SSLErrorCodes_SSL_ERROR_BAD_CERTIFICATE as i32, 0);
+            SECFailure
+        }
+    }
+}
+
+/// Снять цепочку сертификатов собеседника (DER-список).
+/// SSL_PeerCertificateChainDER — экспериментальный API (макрос).
+unsafe fn peer_chain(fd: *mut nssx::PRFileDesc) -> Result<Vec<Vec<u8>>> {
+    let get_chain: Option<
+        unsafe extern "C" fn(*mut nssx::PRFileDesc, *mut *mut nssx::SECItemArray) -> c_int,
+    > = resolve_experimental(c"SSL_PeerCertificateChainDER");
+    let get_chain = get_chain.ok_or_else(|| {
+        Error::new(ErrorCode::Unsupported, "NSS без SSL_PeerCertificateChainDER")
+    })?;
+    let mut arr: *mut nssx::SECItemArray = std::ptr::null_mut();
+    if get_chain(fd, &mut arr) != SECSuccess {
+        return Err(pr_error(
+            ErrorCode::HandshakeFailed,
+            nssx::PR_GetError(),
+            "SSL_PeerCertificateChainDER",
+        ));
+    }
+    if arr.is_null() {
+        return Err(Error::new(
+            ErrorCode::HandshakeFailed,
+            "сервер не предоставил цепочку сертификатов",
+        ));
+    }
+    let items = std::slice::from_raw_parts((*arr).items, (*arr).len as usize);
+    let mut chain = Vec::with_capacity(items.len());
+    for it in items {
+        if !it.data.is_null() {
+            chain.push(std::slice::from_raw_parts(it.data, it.len as usize).to_vec());
+        }
+    }
+    nssx::SECITEM_FreeArray(arr, 1);
+    Ok(chain)
+}
+
+/// Ошибка NSPR → Error.
+unsafe fn pr_error(code: ErrorCode, pr: i32, what: &str) -> Error {
+    let p = nssx::PR_ErrorToString(pr, nssx::PR_LANGUAGE_I_DEFAULT);
+    let msg = if p.is_null() {
+        format!("{what}: NSPR/{pr}")
+    } else {
+        format!(
+            "{what}: {} (NSPR/{pr})",
+            std::ffi::CStr::from_ptr(p).to_string_lossy()
+        )
     };
-    format!("{name} ({code})")
+    Error::new(code, msg)
+}
+
+/// Разрешение экспериментального API NSS по имени.
+unsafe fn resolve_experimental<F: Copy>(name: &std::ffi::CStr) -> Option<F> {
+    let p = nssx::SSL_GetExperimentalAPI(name.as_ptr());
+    if p.is_null() {
+        return None;
+    }
+    let raw: unsafe extern "C" fn() = std::mem::transmute(p);
+    Some(unsafe { std::mem::transmute_copy::<_, F>(&raw) })
 }

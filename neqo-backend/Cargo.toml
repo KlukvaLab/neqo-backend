@@ -1,35 +1,44 @@
 [package]
 name = "neqo-backend"
-version = "0.1.0"
-edition = "2024"
-authors = ["KlukvaLab"]
-description = "Isolated transport backend implementing Firefox TLS (NSS) and QUIC (neqo) transports"
-license = "Apache-2.0"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.90"
+description = "Firefox-fingerprint network backend (TLS / HTTP-3 / WSS) on NSS + neqo, C ABI"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/KlukvaLab/neqo-backend"
 readme = "README.md"
 keywords = ["quic", "firefox", "nss", "transport", "fingerprint"]
 categories = ["network-programming"]
 
 [lib]
-crate-type = ["cdylib", "rlib", "staticlib"]
+name = "neqo_backend"
+crate-type = ["cdylib", "staticlib"]
 
+# --- Пиннованные версии сетевого стека Firefox -------------------------------
+# neqo 0.34.0 — QUIC/HTTP3-стек Firefox: крейты лежат в этом же workspace
+# (клон mozilla/neqo, тег v0.34.0) и подключены по path.
+# NSS-биндинги — единый для всего workspace `nss` (nss-rs из git mozilla/nss-rs,
+# коммит пиннится корневым Cargo.lock). Единый NSS для TLS и QUIC =
+# консистентный отпечаток. NSS >= 3.130 (см. docs/BUILDING.md).
 [dependencies]
+neqo-http3 = { path = "../neqo-http3" }
 neqo-transport = { path = "../neqo-transport" }
 neqo-common = { path = "../neqo-common" }
 nss = { workspace = true }
-tokio = { version = "1.43", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
-parking_lot = "0.12"
-base64 = "0.22"
-sha1 = "0.10"
-rand = "0.8"
-log = "0.4"
-env_logger = "0.10"
-thiserror = "2.0"
-async-trait = "0.1"
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-rustls-pki-types = "1.15.1"
-webpki-roots = "1.0.11"
-rustls-webpki = { version = "0.103.16", features = ["ring"] }
 
-[dev-dependencies]
-tokio-test = "0.4"
+# Верификация сертификатов (обеих веток: TLS и QUIC) отдельным верификатором,
+# как это делает PSM в Firefox. Влияет только на локальную проверку цепочек,
+# НЕ на wire-отпечаток.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+rustls-pemfile = "2"
+rustls-native-certs = "0.8"
+
+# Декомпрессия сжатых сертификатов (RFC 8879) — Firefox предлагает
+# zlib/brotli/zstd в compress_certificate, декодеры обязательны.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+brotli = "7"
+zstd = "0.13"
+
+[build-dependencies]
+bindgen = "0.71"
+pkg-config = "0.3"

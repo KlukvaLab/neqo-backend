@@ -1,303 +1,502 @@
+//! HTTP/3 клиент на neqo — «HTTPS over QUIC».
+//!
+//! neqo — это QUIC/HTTP3-стек Firefox, поэтому ClientHello QUIC-ветки
+//! автоматически совпадает с браузерным (порядок расширений, параметры
+//! транспорта, ALPN "h3"). Синхронный драйвер: UDP-сокет std, цикл
+//! process_output/process_input, события drain'ятся внутри операций.
+
 use std::cell::RefCell;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::collections::HashMap;
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::rc::Rc;
-use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use neqo_common::event::Provider;
-use neqo_common::{Datagram, Tos};
-use neqo_transport::{
-    Connection, ConnectionEvent, ConnectionParameters, Output, RandomConnectionIdGenerator, State,
-    StreamId, StreamType,
+use neqo_common::{Datagram, event::Provider, Tos};
+use neqo_http3::{
+    Header, Http3Client, Http3ClientEvent, Http3Parameters, Http3State, Priority,
 };
-use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use neqo_transport::{
+    Connection, Output, RandomConnectionIdGenerator, StreamId,
 
-use crate::crypto::verify_peer_certificate;
-use crate::mimicry::{StreamReadBuffer, chunk_payload};
+};
 
-/// Commands for the QUIC worker: data to send, or a stream half-close.
-enum QuicCmd {
-    Data(Vec<u8>),
-    /// Half-close: no more data will be sent on the stream (stream FIN).
-    Finish,
+use crate::error::{Error, ErrorCode, Result};
+use crate::verify;
+
+const H3_ALPN: &str = "h3";
+const RECV_BUF: usize = 64 * 1024;
+
+pub struct H3ConnectParams<'a> {
+    pub host: &'a str,
+    pub addr: Option<SocketAddr>,
+    pub port: u16,
+    /// ECHConfigList (байты ech= из DNS HTTPS-записи).
+    pub ech_config_list: Option<&'a [u8]>,
+    /// Токен resumption из предыдущего соединения (0-RTT).
+    pub resumption_token: Option<&'a [u8]>,
+    pub timeout: Duration,
 }
 
-pub struct QuicStream {
-    tx_write: mpsc::Sender<QuicCmd>,
-    rx_read: Mutex<StreamReadBuffer>,
-    closed: Arc<tokio::sync::Notify>,
+/// Один HTTP/3 запрос.
+pub struct H3RequestState {
+    pub stream_id: StreamId,
+    pub status: Option<u16>,
+    pub headers: Vec<(String, Vec<u8>)>,
+    pub body: Vec<u8>,
+    pub body_fin: bool,
+    pub headers_ready: bool,
 }
 
-impl QuicStream {
-    pub async fn connect(host: &str, port: u16, alpn: &[&str]) -> Result<Self, String> {
-        let addr_str = format!("{host}:{port}");
-        let remote_addr = addr_str
-            .to_socket_addrs()
-            .map_err(|e| format!("Failed to resolve {addr_str}: {e}"))?
-            .next()
-            .ok_or_else(|| format!("Could not resolve address {addr_str}"))?;
+pub struct H3Connection {
+    udp: UdpSocket,
+    client: Http3Client,
+    local: SocketAddr,
+    remote: SocketAddr,
+    host: String,
+    resumption_token: Option<Vec<u8>>,
+    requests: HashMap<StreamId, H3RequestState>,
+}
 
-        let local_addr = match remote_addr {
-            SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-            SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0),
-        };
+impl H3Connection {
+    pub fn connect(p: &H3ConnectParams<'_>) -> Result<H3Connection> {
+        let _ = crate::init::global()?;
+        let remote = resolve(p)?;
+        let deadline = Instant::now() + p.timeout;
 
-        let udp_socket = UdpSocket::bind(local_addr)
-            .await
-            .map_err(|e| format!("Failed to bind local UDP socket: {e}"))?;
-
-        let local_bound = udp_socket
-            .local_addr()
-            .map_err(|e| format!("Failed to get local addr: {e}"))?;
-
-        let (tx_write, mut rx_write) = mpsc::channel::<QuicCmd>(128);
-        let (tx_read, rx_read) = mpsc::channel::<Vec<u8>>(128);
-        let closed = Arc::new(tokio::sync::Notify::new());
-        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
-
-        let server_name = host.to_string();
-        let alpn_owned: Vec<String> = if alpn.is_empty() {
-            vec!["h3".to_string(), "hq-interop".to_string()]
+        let bind: SocketAddr = if remote.is_ipv4() {
+            "0.0.0.0:0".parse().unwrap()
         } else {
-            alpn.iter().map(|s| (*s).to_string()).collect()
+            "[::]:0".parse().unwrap()
+        };
+        let udp = UdpSocket::bind(bind)
+            .map_err(|e| Error::new(ErrorCode::Generic, format!("UDP bind: {e}")))?;
+        udp.set_read_timeout(Some(Duration::from_millis(50)))
+            .ok();
+        let local = udp
+            .local_addr()
+            .map_err(|e| Error::generic(format!("local_addr: {e}")))?;
+
+        // CID-генератор: Firefox использует случайные 8-байтовые CID.
+        let cid_gen: Rc<RefCell<dyn neqo_transport::ConnectionIdGenerator>> =
+            Rc::new(RefCell::new(RandomConnectionIdGenerator::new(8)));
+
+        let mut conn = Connection::new_client(
+            p.host,
+            &[H3_ALPN],
+            cid_gen,
+            local,
+            remote,
+            neqo_transport::ConnectionParameters::default(),
+            Instant::now(),
+        )
+        .map_err(map_neqo("Connection::new_client"))?;
+
+        // TLS-шифры QUIC-ветки — как у Firefox (те же три TLS 1.3 набора).
+        conn.set_ciphers(&[
+            nss::TLS_AES_128_GCM_SHA256,
+            nss::TLS_CHACHA20_POLY1305_SHA256,
+            nss::TLS_AES_256_GCM_SHA384,
+        ])
+        .map_err(map_neqo("set_ciphers"))?;
+
+        let mut client = Http3Client::new_with_conn(
+            conn,
+            Http3Parameters::default()
+                // QPACK-настройки как в neqo/Firefox по умолчанию.
+                .max_table_size_encoder(0)
+                .max_table_size_decoder(0)
+                .max_blocked_streams(0),
+        );
+
+        if let Some(ech) = p.ech_config_list {
+            client
+                .enable_ech(ech)
+                .map_err(map_neqo("enable_ech"))?;
+        }
+        if let Some(token) = p.resumption_token {
+            client
+                .enable_resumption(Instant::now(), token)
+                .map_err(map_neqo("enable_resumption"))?;
+        }
+
+        let mut me = H3Connection {
+            udp,
+            client,
+            local,
+            remote,
+            host: p.host.to_string(),
+            resumption_token: None,
+            requests: HashMap::new(),
         };
 
-        let closed_clone = closed.clone();
+        // Гоняем до Connected (или ZeroRtt).
+        me.drive_until(deadline, |me| {
+            matches!(
+                me.client.state(),
+                Http3State::Connected | Http3State::ZeroRtt
+            )
+        })?;
+        match me.client.state() {
+            Http3State::Connected | Http3State::ZeroRtt => Ok(me),
+            st => Err(Error::new(
+                ErrorCode::HandshakeFailed,
+                format!("QUIC handshake: {st:?}"),
+            )),
+        }
+    }
 
-        // Spawn dedicated thread for Neqo connection (Connection is !Send because it uses Rc/RefCell)
-        std::thread::spawn(move || {
-            let local_rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    let _ = ready_tx.send(Err(format!("Failed to build thread runtime: {e}")));
-                    return;
-                }
-            };
+    /// Выполнить запрос (метод/путь/заголовки/тело) и дождаться заголовков
+    /// ответа. Возвращает stream_id; тело читается read_body.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fetch(
+        &mut self,
+        method: &str,
+        path: &str,
+        headers: &[(String, Vec<u8>)],
+        body: Option<&[u8]>,
+        timeout: Duration,
+    ) -> Result<StreamId> {
+        let deadline = Instant::now() + timeout;
 
-            local_rt.block_on(async move {
-                let cid_gen = Rc::new(RefCell::new(RandomConnectionIdGenerator::new(8)));
-                let alpn_refs: Vec<&str> = alpn_owned.iter().map(String::as_str).collect();
+        // Дожидаемся готовности создавать запросы.
+        self.drive_until(deadline, |me| {
+            matches!(me.client.state(), Http3State::Connected)
+        })?;
 
-                let now = Instant::now();
-                // 20s idle timeout enables Neqo's browser keepalive PING probe at 10s idle
-                let params =
-                    ConnectionParameters::default().idle_timeout(std::time::Duration::from_secs(20));
+        let mut h3_headers: Vec<Header> = Vec::with_capacity(headers.len() + 1);
+        for (n, v) in headers {
+            h3_headers.push(Header::new(n.clone(), v.clone()));
+        }
 
-                let mut conn = match Connection::new_client(
-                    &server_name,
-                    &alpn_refs,
-                    cid_gen,
-                    local_bound,
-                    remote_addr,
-                    params,
-                    now,
-                ) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(format!("Neqo new_client error: {e:?}")));
-                        return;
-                    }
-                };
+        let authority = authority_of(&self.host, self.remote.port());
+        let stream_id = self
+            .client
+            .fetch(
+                Instant::now(),
+                method,
+                ("https", authority.as_str(), path),
+                &h3_headers,
+                Priority::default(),
+            )
+            .map_err(map_neqo("fetch"))?;
 
-                let mut active_stream: Option<StreamId> = None;
-                let mut ready_notifier = Some(ready_tx);
-                let mut buf_in = [0u8; 65535];
-
-                loop {
-                    let now = Instant::now();
-
-                    // 1. Process outgoing datagrams and capture scheduled timers
-                    let mut next_timer = None;
-                    loop {
-                        match conn.process_output(now) {
-                            Output::Datagram(dgram) => {
-                                let _ = udp_socket.send_to(dgram.as_ref(), remote_addr).await;
-                            }
-                            Output::Callback(delay) => {
-                                next_timer = Some(delay);
-                                break;
-                            }
-                            Output::None => break,
-                        }
-                    }
-
-                    // 2. Check connection events
-                    while let Some(event) = conn.next_event() {
-                        match event {
-                            ConnectionEvent::AuthenticationNeeded => {
-                                // Strict Mozilla CA root certificate verification
-                                let cert_info = conn.peer_certificate();
-                                let status =
-                                    verify_peer_certificate(cert_info.as_ref(), &server_name);
-                                conn.authenticated(status, now);
-                            }
-                            ConnectionEvent::RecvStreamReadable { stream_id } => {
-                                if Some(stream_id) == active_stream {
-                                    let mut temp = [0u8; 8192];
-                                    while let Ok((read_bytes, fin)) =
-                                        conn.stream_recv(stream_id, &mut temp)
-                                    {
-                                        if read_bytes == 0 {
-                                            break;
-                                        }
-                                        if tx_read.send(temp[..read_bytes].to_vec()).await.is_err() {
-                                            break;
-                                        }
-                                        if fin {
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            ConnectionEvent::RecvStreamReset { .. } => {
-                                break;
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    // 3. Activate stream and register browser keepalive
-                    if conn.state().connected() && active_stream.is_none() {
-                        log::info!("[QUIC] Connected to {}", server_name);
-                        match conn.stream_create(StreamType::BiDi) {
-                            Ok(sid) => {
-                                active_stream = Some(sid);
-                                // Register stream for native Neqo idle keep-alive PING probes
-                                if let Err(e) = conn.stream_keep_alive(sid, true) {
-                                    log::warn!("[QUIC] Failed to enable stream keepalive: {e:?}");
-                                }
-                                if let Some(notifier) = ready_notifier.take() {
-                                    let _ = notifier.send(Ok(()));
-                                }
-                            }
-                            Err(e) => {
-                                if let Some(notifier) = ready_notifier.take() {
-                                    let _ = notifier.send(Err(format!(
-                                        "Failed to create BiDi stream: {e:?}"
-                                    )));
-                                }
-                            }
-                        }
-                    }
-
-                    // Check termination conditions
-                    match conn.state() {
-                        State::Closed(err) => {
-                            if let Some(notifier) = ready_notifier.take() {
-                                let _ =
-                                    notifier.send(Err(format!("QUIC connection closed: {err:?}")));
-                            }
-                            break;
-                        }
-                        State::Closing { .. } | State::Draining { .. } => {
-                            if let Some(notifier) = ready_notifier.take() {
-                                let _ = notifier.send(Err(
-                                    "QUIC connection closed before handshake completed"
-                                        .to_string(),
-                                ));
-                            }
-                            break;
-                        }
-                        _ => {}
-                    }
-
-                    // 4. Sleep exactly until the next Neqo timer (ACK/PTO/
-                    // keepalive). Incoming datagrams wake us via recv_from;
-                    // the 250ms cap is only a safety tick.
-                    let sleep_duration = next_timer
-                        .unwrap_or(std::time::Duration::from_millis(250));
-
-                    tokio::select! {
-                        recv_res = udp_socket.recv_from(&mut buf_in) => {
-                            match recv_res {
-                                Ok((len, from_addr)) => {
-                                    let dgram = Datagram::new(from_addr, local_bound, Tos::from(0), &buf_in[..len]);
-                                    conn.process_input(dgram, Instant::now());
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                        write_opt = rx_write.recv() => {
-                            match write_opt {
-                                Some(QuicCmd::Data(data)) => {
-                                    if let Some(sid) = active_stream {
-                                        // MTU-friendly chunking to dirty packet sizes
-                                        let chunks = chunk_payload(&data);
-                                        for chunk in chunks {
-                                            let _ = conn.stream_send(sid, chunk);
-                                        }
-                                    }
-                                }
-                                Some(QuicCmd::Finish) => {
-                                    if let Some(sid) = active_stream {
-                                        let _ = conn.stream_close_send(sid);
-                                    }
-                                    // Keep the connection alive for reading.
-                                }
-                                None => break,
-                            }
-                        }
-                        _ = closed_clone.notified() => {
-                            conn.close(Instant::now(), 0, "kthxbye");
-                            break;
-                        }
-                        _ = tokio::time::sleep(sleep_duration) => {
-                            // Tick connection timer / send scheduled keepalive ping
-                        }
+        if let Some(b) = body {
+            if !b.is_empty() {
+                let mut sent = 0usize;
+                while sent < b.len() {
+                    self.drive_until(deadline, |_| true)?;
+                    let n = self
+                        .client
+                        .send_data(stream_id, &b[sent..], Instant::now())
+                        .map_err(map_neqo("send_data"))?;
+                    sent += n;
+                    if n == 0 {
+                        self.pump_output()?;
                     }
                 }
+            }
+        }
+        self.client
+            .stream_close_send(stream_id, Instant::now())
+            .map_err(map_neqo("stream_close_send"))?;
 
-                closed_clone.notify_waiters();
-            });
-        });
+        self.requests.insert(
+            stream_id,
+            H3RequestState {
+                stream_id,
+                status: None,
+                headers: Vec::new(),
+                body: Vec::new(),
+                body_fin: false,
+                headers_ready: false,
+            },
+        );
+        Ok(stream_id)
+    }
 
-        // Wait for handshake completion with deterministic timeout
-        let handshake_timeout = std::time::Duration::from_secs(10);
-        match tokio::time::timeout(handshake_timeout, ready_rx).await {
-            Ok(Ok(Ok(()))) => Ok(Self {
-                tx_write,
-                rx_read: Mutex::new(StreamReadBuffer::new(rx_read)),
-                closed,
-            }),
-            Ok(Ok(Err(e))) => Err(e),
-            Ok(Err(_)) => Err("QUIC handshake worker terminated unexpectedly".to_string()),
-            Err(_) => {
-                closed.notify_waiters();
-                Err(format!(
-                    "QUIC connection to {host}:{port} timed out after {}s",
-                    handshake_timeout.as_secs()
-                ))
+    /// Дождаться заголовков ответа (status + headers).
+    pub fn wait_response(&mut self, stream_id: StreamId, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        self.drive_until(deadline, |me| {
+            me.requests
+                .get(&stream_id)
+                .is_some_and(|r| r.headers_ready || r.body_fin)
+        })?;
+        let st = self
+            .requests
+            .get(&stream_id)
+            .ok_or_else(|| Error::invalid_arg("неизвестный stream_id"))?;
+        if !st.headers_ready {
+            return Err(Error::new(
+                ErrorCode::ProtocolError,
+                "ответ без заголовков",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Прочитать до buf.len() байт тела. 0 = тело закончено.
+    pub fn read_body(
+        &mut self,
+        stream_id: StreamId,
+        buf: &mut [u8],
+        timeout: Duration,
+    ) -> Result<usize> {
+        let deadline = Instant::now() + timeout;
+        self.drive_until(deadline, |me| {
+            me.requests
+                .get(&stream_id)
+                .is_some_and(|r| !r.body.is_empty() || r.body_fin)
+        })?;
+        let st = self
+            .requests
+            .get_mut(&stream_id)
+            .ok_or_else(|| Error::invalid_arg("неизвестный stream_id"))?;
+        if st.body.is_empty() {
+            return Ok(0); // fin
+        }
+        let n = buf.len().min(st.body.len());
+        buf[..n].copy_from_slice(&st.body[..n]);
+        st.body.drain(..n);
+        Ok(n)
+    }
+
+    /// Состояние запроса (заголовки/статус).
+    pub fn request(&self, stream_id: StreamId) -> Option<&H3RequestState> {
+        self.requests.get(&stream_id)
+    }
+
+    /// Снять токен resumption (для следующего соединения / 0-RTT).
+    pub fn take_resumption_token(&mut self) -> Option<Vec<u8>> {
+        self.resumption_token.take()
+    }
+
+    pub fn close(&mut self) {
+        self.client.close(Instant::now(), 0, "nb");
+    }
+
+    // --- драйвер -------------------------------------------------------------
+
+    /// Гонять сетевой цикл, пока `pred` не станет true (или дедлайн).
+    fn drive_until(
+        &mut self,
+        deadline: Instant,
+        pred: impl Fn(&mut Self) -> bool,
+    ) -> Result<()> {
+        loop {
+            if pred(self) {
+                self.drain_events()?;
+                if pred(self) {
+                    return Ok(());
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::timeout("h3: таймаут операции"));
+            }
+            self.pump_output()?;
+            self.pump_input(deadline)?;
+            self.drain_events()?;
+        }
+    }
+
+    /// Забрать все исходящие датаграммы (Output::Datagram → UDP).
+    fn pump_output(&mut self) -> Result<()> {
+        loop {
+            let out = self.client.process_output(Instant::now());
+            match out {
+                Output::Datagram(dg) => {
+                    let dst = dg.destination();
+                    self.udp
+                        .send_to(&dg, dst)
+                        .map_err(|e| Error::generic(format!("UDP send: {e}")))?;
+                }
+                Output::Callback(d) => {
+                    // Ждать данные или таймер (handled в pump_input).
+                    self.wait_readable(Some(d))?;
+                    return Ok(());
+                }
+                Output::None => return Ok(()),
             }
         }
     }
 
-    pub async fn read(&self, buf: &mut [u8]) -> Result<usize, String> {
-        let mut rx = self.rx_read.lock().await;
-        rx.read(buf).await
+    /// Прочитать датаграммы из сокета (до дедлайна) и скормить neqo.
+    fn pump_input(&mut self, deadline: Instant) -> Result<()> {
+        loop {
+            if Instant::now() >= deadline {
+                return Ok(());
+            }
+            let cb = self.client.process_output(Instant::now());
+            let timer = match cb {
+                Output::Callback(d) => Some(d),
+                Output::Datagram(dg) => {
+                    let dst = dg.destination();
+                    self.udp
+                        .send_to(&dg, dst)
+                        .map_err(|e| Error::generic(format!("UDP send: {e}")))?;
+                    continue;
+                }
+                Output::None => return Ok(()),
+            };
+            if !self.wait_readable(timer)? {
+                return Ok(()); // таймер вышел
+            }
+            let mut buf = [0u8; RECV_BUF];
+            let (n, from) = self
+                .udp
+                .recv_from(&mut buf)
+                .map_err(|e| Error::generic(format!("UDP recv: {e}")))?;
+            let dg = Datagram::new(
+                from,
+                self.local,
+                Tos::default(),
+                buf[..n].to_vec(),
+            );
+            self.client.process_input(dg, Instant::now());
+        }
     }
 
-    pub async fn write(&self, buf: &[u8]) -> Result<usize, String> {
-        self.tx_write
-            .send(QuicCmd::Data(buf.to_vec()))
-            .await
-            .map_err(|e| format!("Send error: {e}"))?;
-        Ok(buf.len())
+    /// Ждать читаемости сокета. `timer` — сколько готов ждать neqo.
+    /// Возвращает false, если ожидание прервано по таймеру.
+    fn wait_readable(&self, timer: Option<Duration>) -> Result<bool> {
+        let wait = timer
+            .unwrap_or(Duration::from_millis(20))
+            .min(Duration::from_millis(200))
+            .max(Duration::from_millis(1));
+        self.udp.set_read_timeout(Some(wait)).ok();
+        // 1 байт достаточно: MSG_PEEK не потребляет данные.
+        let mut probe = [0u8; 1];
+        match self.udp.peek_from(&mut probe) {
+            Ok(_) => Ok(true),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(Error::generic(format!("UDP peek: {e}"))),
+        }
     }
 
-    /// Half-closes the stream: sends the stream FIN. The connection stays
-    /// usable for reading (e.g. HTTP/0.9-style request/response).
-    pub async fn finish(&self) -> Result<(), String> {
-        self.tx_write
-            .send(QuicCmd::Finish)
-            .await
-            .map_err(|e| format!("Send error: {e}"))
+    /// Разобрать события neqo (верификация, заголовки, данные, токены).
+    fn drain_events(&mut self) -> Result<()> {
+        while let Some(event) = self.client.next_event() {
+            match event {
+                Http3ClientEvent::AuthenticationNeeded => {
+                    let chain: Vec<Vec<u8>> = self
+                        .client
+                        .peer_certificate()
+                        .map(|info| info.into_iter().map(|c| c.to_vec()).collect())
+                        .unwrap_or_default();
+                    let status = if verify::verify_server_chain(&chain, &self.host).is_ok() {
+                        nss::AuthenticationStatus::Ok
+                    } else {
+                        // Детали ошибки уже в nb_last_error_message;
+                        // neqo требует лишь «доверяем/не доверяем».
+                        nss::AuthenticationStatus::CertUntrusted
+                    };
+                    self.client.authenticated(status, Instant::now());
+                }
+                Http3ClientEvent::HeaderReady {
+                    stream_id,
+                    headers,
+                    interim,
+                    ..
+                } => {
+                    if let Some(st) = self.requests.get_mut(&stream_id) {
+                        if !interim {
+                            // Псевдозаголовок :status → код ответа,
+                            // остальные псевдозаголовки наружу не отдаём.
+                            for h in headers {
+                                let name = h.name();
+                                if name == ":status" {
+                                    st.status =
+                                        String::from_utf8_lossy(h.value()).parse().ok();
+                                } else if name.starts_with(':') {
+                                    continue;
+                                } else {
+                                    st.headers
+                                        .push((name.to_string(), h.value().to_vec()));
+                                }
+                            }
+                            st.headers_ready = true;
+                        }
+                    }
+                }
+                Http3ClientEvent::DataReadable { stream_id } => {
+                    let mut chunk = vec![0u8; RECV_BUF];
+                    loop {
+                        let (n, fin) = self
+                            .client
+                            .read_data(Instant::now(), stream_id, &mut chunk)
+                            .map_err(map_neqo("read_data"))?;
+                        if let Some(st) = self.requests.get_mut(&stream_id) {
+                            st.body.extend_from_slice(&chunk[..n]);
+                            if fin {
+                                st.body_fin = true;
+                            }
+                        }
+                        if n == 0 || fin {
+                            break;
+                        }
+                    }
+                }
+                Http3ClientEvent::Reset { stream_id, .. }
+                | Http3ClientEvent::StopSending { stream_id, .. } => {
+                    if let Some(st) = self.requests.get_mut(&stream_id) {
+                        st.body_fin = true;
+                    }
+                }
+                Http3ClientEvent::ResumptionToken(token) => {
+                    self.resumption_token = Some(token.as_ref().to_vec());
+                }
+                Http3ClientEvent::StateChange(Http3State::Connected)
+                | Http3ClientEvent::StateChange(Http3State::ZeroRtt) => {}
+                Http3ClientEvent::ZeroRttRejected => {
+                    // 0-RTT отклонён — запросы придётся повторить;
+                    // для v1 сигнализируем ошибкой активные запросы.
+                    for st in self.requests.values_mut() {
+                        st.body_fin = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
+}
 
-    pub fn close(&self) {
-        self.closed.notify_waiters();
+fn resolve(p: &H3ConnectParams<'_>) -> Result<SocketAddr> {
+    if let Some(a) = p.addr {
+        return Ok(a);
     }
+    let host = p.host.trim_start_matches('[').trim_end_matches(']');
+    match (host, p.port).to_socket_addrs() {
+        Ok(mut addrs) => addrs
+            .next()
+            .ok_or_else(|| Error::new(ErrorCode::DnsFailure, "адрес не разрешён")),
+        Err(e) => Err(Error::new(
+            ErrorCode::DnsFailure,
+            format!("DNS {host}: {e}"),
+        )),
+    }
+}
+
+fn authority_of(host: &str, port: u16) -> String {
+    let default = port == 443;
+    if host.contains(':') && !host.starts_with('[') {
+        if default {
+            format!("[{host}]")
+        } else {
+            format!("[{host}]:{port}")
+        }
+    } else if default {
+        host.to_string()
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn map_neqo<E: std::fmt::Debug>(what: &'static str) -> impl Fn(E) -> Error {
+    move |e| Error::new(ErrorCode::ProtocolError, format!("{what}: {e:?}"))
 }

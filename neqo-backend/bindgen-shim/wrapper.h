@@ -1,0 +1,10 @@
+/* Shim-заголовок для bindgen: только то, что нужно neqo-backend. */
+#include "prio.h"
+#include "prnetdb.h"
+#include "prerror.h"
+#include "secitem.h"
+#include "secerr.h"
+#include "sslproto.h"
+#include "ssl.h"
+#include "sslerr.h"
+#include "sslexp.h"
