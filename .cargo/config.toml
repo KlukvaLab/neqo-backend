@@ -1,0 +1,4 @@
+# rpath=$ORIGIN: библиотека всегда грузит NSS из своего каталога
+# (пиннованный 3.130 рядом с libneqo_backend.so), а не системный.
+[build]
+rustflags = ["-C", "link-arg=-Wl,-rpath,$ORIGIN"]

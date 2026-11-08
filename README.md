@@ -1,54 +1,128 @@
-# neqo-backend (Workspace)
+# neqo-backend
 
-Workspace на базе [Mozilla Neqo](https://github.com/mozilla/neqo) (v0.34.0)
-для сборки `neqo-backend` — сетевого бэкенда с TLS/QUIC-отпечатком Firefox.
+Сетевой бэкенд с TLS-отпечатком **Firefox** для прокси Gorynych.
+Rust-библиотека с C ABI (без JNI) для Kotlin-приложений (Android + Desktop).
 
-Maintained by [KlukvaLab](https://github.com/KlukvaLab).
+## Что это
 
-## Состав
+Библиотека даёт три транспортных пути, неотличимых от настоящего Firefox
+на уровне TLS/QUIC ClientHello:
 
-- **`neqo-backend/`** — C-ABI мост (`nb_*` API): TLS 1.2/1.3 (NSS), HTTP/3
-  (QUIC), WSS (RFC 6455). Отпечаток Firefox (шифры, группы, GREASE,
-  пермутация расширений — константы из исходников Gecko), строгая
-  верификация сертификатов (небезопасного режима нет).
-  Документация: `neqo-backend/docs/` (README, BUILDING, FINGERPRINT,
-  PITFALLS, USAGE).
-- **`neqo-transport/`**, **`neqo-http3/`**, **`neqo-common/`**, ... —
-  официальный QUIC-стек Mozilla (тот же код, что в Firefox), v0.34.0.
+| Путь | Стек | Отпечаток |
+|---|---|---|
+| **HTTPS over TLS** | NSS (тот же, что в Firefox) | задаётся `fingerprint.rs` по исходникам Gecko |
+| **HTTPS over QUIC (HTTP/3)** | neqo 0.34.0 — QUIC-стек Firefox | автоматически (neqo = код браузера) |
+| **WSS (WebSocket over TLS)** | NSS + RFC 6455-фрейминг | TLS — как выше; фрейминг как WebSocketChannel |
 
-## Требования
+Все соединения **принудительно проверяются**: цепочка сертификатов
+сервера (построение пути, подписи, сроки, SAN, EKU) обязана пройти
+проверку — небезопасный режим отсутствует в API.
 
-```bash
-sudo apt update && sudo apt install -y build-essential clang libclang-dev \
-    ninja-build python3 python3-pip pkg-config
-# NSS 3.130 (пиннинг версий) — собирается один раз:
-neqo-backend/scripts/fetch_nss.sh
+## Почему отпечаток совпадает
+
+1. **Тот же код**: NSS и neqo — это библиотеки, которыми пользуется сам
+   Firefox. neqo формирует QUIC-ClientHello идентично браузеру.
+2. **Та же конфигурация**: TLS-сокеты настраиваются по данным, снятым с
+   `nsNSSIOLayer.cpp` / `nsNSSComponent.cpp` / `StaticPrefList.yaml`
+   Gecko — наборы шифров, группы (включая X25519MLKEM768), GREASE,
+   пермутация расширений, сигнатурные схемы, сжатие сертификатов.
+   Подробности: [docs/FINGERPRINT.md](docs/FINGERPRINT.md).
+3. **Пиннинг версий**: `neqo 0.34.0`, `nss-rs 0.16.3`, `NSS 3.130` —
+   см. [docs/BUILDING.md](docs/BUILDING.md).
+
+## Структура
+
 ```
+ffi/neqo_backend.h   — заголовок C ABI (для JNA и C)
+src/
+  ffi.rs             — extern "C" слой (изолирует ABI от ядра)
+  fingerprint.rs     — профиль Firefox (все константы с источниками)
+  tls.rs             — TLS-сокеты NSPR/NSS
+  http1.rs           — минимальный HTTP/1.1 (нужен для WSS)
+  ws.rs, sha1.rs     — RFC 6455 клиент
+  quic.rs            — HTTP/3 клиент (neqo) с синхронным драйвером
+  init.rs, verify.rs — NSS init, корни, верификация цепочек
+  error.rs           — коды ошибок C ABI
+scripts/             — сборка под все целевые платформы
+docs/                — документация (RU)
+```
+
+## Быстрый старт (C)
+
+```c
+#include "neqo_backend.h"
+
+nb_init(NULL, 0);                       // корни из ОС; на Android — PEM
+
+NbConnectOptions opts = {0};
+opts.host = "example.org";
+opts.port = 443;
+opts.timeout_ms = 15000;
+opts.profile = 0;                       // 0 = firefox-desktop
+
+/* 1) сырой TLS (байтовый поток) */
+NbTls *tls = nb_tls_connect(&opts);
+nb_tls_write(tls, req, req_len, 5000);
+int n = nb_tls_read(tls, buf, sizeof(buf), 5000);
+nb_tls_close(tls);
+
+/* 2) HTTP/3 */
+NbH3 *h3 = nb_h3_connect(&opts);
+NbH3Request *r = nb_h3_fetch(h3, "GET", "/", NULL, 0, NULL, 0, 15000);
+int status = nb_h3_req_status(r);       /* ждём != -1 через poll статуса */
+int body = nb_h3_req_read(r, buf, sizeof(buf), 5000);
+nb_h3_req_free(r); nb_h3_close(h3);
+
+/* 3) WSS */
+NbWs *ws = nb_ws_connect(&opts, "/ws", NULL, 0);
+nb_ws_send(ws, 1 /*text*/, "hello", 5, 5000);
+int len = nb_ws_recv(ws, &opcode, buf, sizeof(buf), 5000);
+nb_ws_close(ws, 1000, "bye", 5000);
+```
+
+Список функций, коды ошибок, ECH, 0-RTT-токены и использование из
+Kotlin/JNA: [docs/USAGE.md](docs/USAGE.md).
 
 ## Сборка
 
+Требуется pinned-набор (скрипты делают всё сами):
+
 ```bash
-./build.sh --release
+scripts/fetch_nss.sh          # NSS 3.130 + NSPR 4.39, проверка sha256
+scripts/build_linux.sh x86_64 # и/или: i686, aarch64
+scripts/build_android.sh arm64 # и/или: arm32
 ```
 
-Библиотека: `target/release/libneqo_backend.so` (NSS .so копируются рядом,
-rpath=$ORIGIN). Заголовок: `neqo-backend/ffi/neqo_backend.h`.
+Полное описание (зависимости, NDK, Windows, кросс-компиляция):
+[docs/BUILDING.md](docs/BUILDING.md).
 
-Прочие платформы: `neqo-backend/scripts/build_linux.sh` (i686/aarch64),
-`build_android.sh` (arm64/arm32), `build_windows.sh` (x64/x32).
-Подробности: `neqo-backend/docs/BUILDING.md`.
+## Документация
 
-## C ABI (кратко)
+* [docs/BUILDING.md](docs/BUILDING.md) — сборка, таргеты, пиннинг
+* [docs/FINGERPRINT.md](docs/FINGERPRINT.md) — анатомия отпечатка
+* [docs/PITFALLS.md](docs/PITFALLS.md) — ловушки NSS/neqo (обязательно к прочтению)
+* [docs/USAGE.md](docs/USAGE.md) — C ABI, Kotlin/JNA, сценарии
 
-`nb_version` — версия; `nb_init(pem_roots, len)` — инициализация NSS +
-корни (пусто = корни ОС); `nb_tls_connect/read/write/close` — TLS-сокет;
-`nb_h3_connect`, `nb_h3_fetch`, `nb_h3_req_*` — HTTP/3; `nb_ws_connect/
-send/recv/close` — WSS; `nb_get_last_error` — текст последней ошибки.
+## Статус v1
 
-Полный список, коды ошибок, ECH/0-RTT-аргументы, Kotlin/JNA — в
-`neqo-backend/ffi/neqo_backend.h` и `neqo-backend/docs/USAGE.md`.
+* TLS 1.2/1.3 (профили desktop/android), HTTP/1.1, HTTP/3, WSS — готово.
+* ECH (реальный + GREASE) — передаётся аргументами методов; Kotlin-слой
+  приложения сам получает ECHConfigList из DNS и подставляет.
+* Не входит в v1: HTTP/2, TLS-resumption, Happy Eyeballs, OCSP-checking
+  (stapling запрашивается как в Firefox, но статус не проверяется).
 
-## Лицензия
+## Проверено (Linux x86_64, машина сборки)
 
-MIT OR Apache-2.0. См. [LICENSE-MIT](LICENSE-MIT),
-[LICENSE-APACHE](LICENSE-APACHE).
+Е2Е-тест `tests/smoke.c` (компилируется с `ffi/neqo_backend.h`, линкуется
+с собранной `libneqo_backend.so`):
+
+| Проверка | Результат |
+|---|---|
+| `cargo test` | 2 passed (SHA-1 векторы, RFC 6455 accept) |
+| TLS + HTTP/1.1 GET example.com | **200**, тело прочитано (в т.ч. chunked) |
+| HTTP/3 GET example.com (QUIC handshake + верификация цепочки) | **200**, 321 байт |
+| HTTP/3 с resumption-токеном (`tests/h3_resume.c`) | два соединения подряд, **200/200** |
+| WSS (text/binary/ping/close, echo) | **эхо text+binary**, close-кадр 1000 |
+| ECH (конфиг из DoH, crypto.cloudflare.com) | handshake с ECH, `/cdn-cgi/trace` → `sni=encrypted` |
+| Отпечаток (tls.browserleaks.com) | JA4 `t13d171500_5b57614c22b0_b04147b66ede`, JA3 `8bebffacf19dcad5fd6481c4663b91dc` — структура (TLS1.3/SNI/17 шифров/21 расширение) соответствует Firefox; с ALPN "h2" префикс станет `t13d1715h2`, как у браузера |
+| Рантайм без LD_LIBRARY_PATH | rpath=$ORIGIN на всех .so, NSS 3.130 из бандла |
